@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -5,6 +6,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Single global .env lives at the repo root.
 # backend/app/config.py → up 3 dirs → repo root.
 ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
+
+# macOS Python ships without trusted CA roots in the default ssl context, so
+# aiohttp/redis-py fail TLS verification against Supabase, ClickHouse Cloud,
+# Upstash, etc. Point both SSL_CERT_FILE and REQUESTS_CA_BUNDLE at certifi's
+# bundle before any client library creates an SSL context.
+if not os.environ.get("SSL_CERT_FILE"):
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    except ImportError:
+        pass
 
 
 class Settings(BaseSettings):

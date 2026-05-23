@@ -47,7 +47,7 @@ def _now() -> str:
 
 
 async def _postgres_ok() -> str:
-    if pool is None:
+    if not pool:
         return "missing"
     try:
         async with pool.acquire() as conn:
@@ -155,7 +155,7 @@ async def clusters(
     status: str = "active",
     min_severity: str | None = None,
 ) -> dict[str, Any]:
-    if pool is None:
+    if not pool:
         return {"clusters": [], "total": 0, **PlaceholderStore.meta()}
 
     async with pool.acquire() as conn:
@@ -199,7 +199,7 @@ async def clusters(
 @router.get("/queue")
 async def queue(brand_id: str = Query(...), limit: int = Query(default=50, ge=1, le=200)):
     # TODO(Track 1): enrich with score breakdowns once scoring helpers and stores exist.
-    if pool is None:
+    if not pool:
         return {
             "queue": [],
             "threshold_config": {"critical": 700, "high": 400, "medium": 200},
@@ -241,7 +241,7 @@ async def actions(
     type: str | None = None,
     state: str = "pending",
 ) -> dict[str, Any]:
-    if pool is None:
+    if not pool:
         return {"actions": [], "total": 0, **PlaceholderStore.meta()}
     where = "brand_id=$1 AND state=$2"
     params: list[Any] = [uuid.UUID(brand_id), state]
@@ -279,7 +279,7 @@ async def actions(
 
 @router.post("/actions/{action_id}")
 async def decide_action(action_id: str, body: DecisionBody) -> dict[str, Any]:
-    if pool is None:
+    if not pool:
         return {
             "id": action_id,
             "state": "skipped",
@@ -305,7 +305,7 @@ async def decide_action(action_id: str, body: DecisionBody) -> dict[str, Any]:
 
 @router.post("/brands")
 async def create_brand(brand: Brand) -> dict[str, Any]:
-    if pool is None:
+    if not pool:
         data = brand.model_dump()
         data.update(PlaceholderStore.meta())
         return data
@@ -329,6 +329,6 @@ async def create_brand(brand: Brand) -> dict[str, Any]:
 @router.patch("/brands/{brand_id}")
 async def update_brand(brand_id: str, patch: BrandPatch) -> dict[str, Any]:
     # TODO(Track 1): implement DB-backed partial update during integration.
-    if pool is None:
+    if not pool:
         return {"id": brand_id, "updated": patch.model_dump(exclude_none=True), **PlaceholderStore.meta()}
     raise HTTPException(status_code=501, detail="brand patch integration pending")

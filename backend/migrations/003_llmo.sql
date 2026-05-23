@@ -1,20 +1,20 @@
-CREATE TABLE IF NOT EXISTS llmo_audits (
+DROP TABLE IF EXISTS llmo_audits;
+
+CREATE TABLE llmo_audits (
     id                    UUID,
     brand_id              UUID,
-    prompt_id             Nullable(UUID),
-    provider              LowCardinality(String),
-    model                 LowCardinality(String),
+    llm                   LowCardinality(String),
     prompt                String,
+    prompt_id             Nullable(String),
     response              String,
-    cited                 UInt8,
-    mention_rank          UInt8,
-    visibility_score      Float32,
-    sentiment_score       Float32,
-    citations             Array(String),
+    mentioned             UInt8,
+    position              UInt8,
+    competitors_mentioned Array(String),
+    sentiment             Float32,
     claims                Array(String),
     drift_score           Float32,
-    raw                   String,
-    created_at            DateTime64(3, 'UTC') DEFAULT now64()
+    citation_accuracy     Float32,
+    ingested_at           DateTime64(3, 'UTC') DEFAULT now64()
 )
 ENGINE = MergeTree
-ORDER BY (brand_id, provider, model, created_at);
+ORDER BY (brand_id, llm, ingested_at);

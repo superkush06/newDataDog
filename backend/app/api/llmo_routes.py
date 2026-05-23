@@ -50,17 +50,17 @@ async def audits(
     where = ["brand_id = %(brand_id)s"]
     params: dict[str, Any] = {"brand_id": brand_id, "limit": limit}
     if provider:
-        where.append("provider = %(provider)s")
+        where.append("llm = %(provider)s")
         params["provider"] = provider
     rows = (
         await ch().query(
             f"""
-            SELECT id, prompt_id, provider, model, prompt, response, cited,
-                   mention_rank, visibility_score, sentiment_score, citations,
-                   claims, drift_score, created_at
+            SELECT id, brand_id, llm, prompt, prompt_id, response, mentioned,
+                   position, competitors_mentioned, sentiment, claims,
+                   drift_score, citation_accuracy, ingested_at
             FROM llmo_audits
             WHERE {' AND '.join(where)}
-            ORDER BY created_at DESC
+            ORDER BY ingested_at DESC
             LIMIT %(limit)s
             """,
             params,
@@ -70,19 +70,19 @@ async def audits(
         "audits": [
             {
                 "id": str(row[0]),
-                "prompt_id": str(row[1]) if row[1] else None,
-                "provider": row[2],
-                "model": row[3],
-                "prompt": row[4],
+                "brand_id": str(row[1]),
+                "llm": row[2],
+                "prompt": row[3],
+                "prompt_id": str(row[4]) if row[4] else None,
                 "response": row[5],
-                "cited": bool(row[6]),
-                "mention_rank": row[7],
-                "visibility_score": row[8],
-                "sentiment_score": row[9],
-                "citations": list(row[10] or []),
-                "claims": list(row[11] or []),
-                "drift_score": row[12],
-                "created_at": row[13].isoformat() if row[13] else None,
+                "mentioned": bool(row[6]),
+                "position": int(row[7]),
+                "competitors_mentioned": list(row[8] or []),
+                "sentiment": float(row[9]),
+                "claims": list(row[10] or []),
+                "drift_score": float(row[11]),
+                "citation_accuracy": float(row[12]),
+                "ingested_at": row[13].isoformat() if row[13] else None,
             }
             for row in rows
         ]
@@ -96,7 +96,7 @@ async def probe(brand_id: str = Query(...)) -> dict[str, Any]:
 
 @router.get("/brands/{brand_id}/prompts")
 async def list_prompts(brand_id: str) -> dict[str, Any]:
-    if pool is None:
+    if not pool:
         return {"prompts": [], "mode": "placeholder", "reason": "missing_db"}
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -123,7 +123,7 @@ async def list_prompts(brand_id: str) -> dict[str, Any]:
 
 @router.post("/brands/{brand_id}/prompts")
 async def add_prompt(brand_id: str, body: PromptBody) -> dict[str, Any]:
-    if pool is None:
+    if not pool:
         return {
             "id": None,
             "brand_id": brand_id,

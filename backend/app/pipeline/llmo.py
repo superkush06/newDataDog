@@ -5,6 +5,7 @@ system prompts. The judge pass that extracts mention/position/drift uses
 the same Groq client (llama-3.1-8b-instant). Real provider APIs (Anthropic,
 OpenAI, Perplexity) are a post-MVP swap — same probe shape.
 """
+import asyncio
 import json
 import uuid
 from datetime import datetime, timezone
@@ -16,7 +17,10 @@ from app.core.metrics import statsd, span
 from app.core.llm import _get_client, JUDGE_MODEL
 
 LLMS = ["claude", "chatgpt", "gemini", "perplexity"]
-REPETITIONS = 3  # within-prompt repetition for stability (research: ≥2 → 88.9% acc)
+# Hackathon/free-tier constraint: Groq llama-3.1-8b judge tier is 6000 TPM.
+# 3 prompts × 4 LLMs × 1 rep × 2 calls = 24 calls per probe — safe with a small pace.
+REPETITIONS = 1
+GROQ_PACE_SECONDS = 1.5
 
 SYSTEM_PROMPTS = {
     "claude": "You are Claude, Anthropic's helpful AI assistant. Respond with measured analysis, multiple perspectives, and structured reasoning. Training cutoff late 2024.",
@@ -105,9 +109,13 @@ async def run_probe(brand_id: str):
     ground_truth = brand["ground_truth"] or ""
     rows_to_insert = []
 
+    first = True
     for prow in prompts:
         for llm in LLMS:
             for _ in range(REPETITIONS):
+                if not first:
+                    await asyncio.sleep(GROQ_PACE_SECONDS)
+                first = False
                 r = await _run_one(llm, prow["prompt"], brand["name"], competitors, ground_truth)
                 citation_accuracy = 100.0 * (1.0 - r["drift_score"]) if r["mentioned"] else 0.0
                 rows_to_insert.append([

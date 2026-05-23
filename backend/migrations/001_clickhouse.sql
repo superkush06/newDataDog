@@ -24,7 +24,8 @@ CREATE MATERIALIZED VIEW IF NOT EXISTS cluster_engagement_mv
 ENGINE = SummingMergeTree
 ORDER BY (brand_id, cluster_id)
 AS SELECT
-    brand_id, cluster_id,
+    brand_id,
+    assumeNotNull(cluster_id)     AS cluster_id,
     count()                       AS post_count,
     sum(likes)                    AS likes,
     sum(shares)                   AS shares,

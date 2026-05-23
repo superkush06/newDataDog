@@ -1,6 +1,7 @@
 """Brand-level score API."""
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Any
 
@@ -30,7 +31,7 @@ async def scores(brand_id: str = Query(...), recompute_now: bool = False) -> dic
         if recomputed is not None:
             return recomputed
 
-    if pool is None:
+    if not pool:
         return {
             "brand_id": brand_id,
             "overall": 0,
@@ -78,7 +79,18 @@ async def scores(brand_id: str = Query(...), recompute_now: bool = False) -> dic
             "sparklines": {"overall": [], "social": [], "llmo": []},
         }
 
-    breakdown = row["breakdown"] if isinstance(row["breakdown"], dict) else {}
+    raw_breakdown = row["breakdown"]
+    if isinstance(raw_breakdown, str):
+        try:
+            breakdown = json.loads(raw_breakdown)
+        except (TypeError, ValueError):
+            breakdown = {}
+    elif isinstance(raw_breakdown, dict):
+        breakdown = raw_breakdown
+    else:
+        breakdown = {}
+    breakdown.setdefault("social_breakdown", {})
+    breakdown.setdefault("llmo_breakdown", {"per_provider": {}, "per_llm": {}})
     return {
         "brand_id": brand_id,
         "overall": row["overall"],

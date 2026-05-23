@@ -13,6 +13,15 @@ MIGRATIONS = ROOT / "migrations"
 # Global .env at repo root
 load_dotenv(REPO_ROOT / ".env")
 
+# macOS Python often lacks trusted CA roots — point everything at certifi's bundle.
+if not os.environ.get("SSL_CERT_FILE"):
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    except ImportError:
+        pass
+
 
 def _statements(path: Path) -> list[str]:
     return [stmt.strip() for stmt in path.read_text().split(";") if stmt.strip()]

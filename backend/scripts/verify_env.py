@@ -19,6 +19,16 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 load_dotenv(REPO_ROOT / ".env")
 
+# macOS Python often lacks trusted CA roots — point everything at certifi's
+# bundle so aiohttp/redis-py/asyncpg can verify Supabase, CH Cloud, Upstash certs.
+if not os.environ.get("SSL_CERT_FILE"):
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    except ImportError:
+        pass
+
 OK = "\033[32m✓\033[0m"
 FAIL = "\033[31m✗\033[0m"
 SKIP = "\033[33m⊘\033[0m"

@@ -3,7 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Any
+
+from dotenv import load_dotenv
+
+# Load global .env at repo root + ensure macOS Python uses certifi CA bundle.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+if not os.environ.get("SSL_CERT_FILE"):
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    except ImportError:
+        pass
 
 
 CROSBY = {
