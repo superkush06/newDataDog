@@ -116,7 +116,7 @@ class TweetMonitor:
             r = requests.post(
                 self.cfg.nimble_x_endpoint,
                 headers={
-                    "Authorization": f"Basic {self.cfg.nimble_api_key}",
+                    "Authorization": f"Bearer {self.cfg.nimble_api_key}",
                     "Content-Type": "application/json",
                 },
                 json={
