@@ -57,7 +57,7 @@ def load_config() -> XAgentConfig:
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
     return XAgentConfig(
-        target_handle=os.environ.get("X_AGENT_TARGET_HANDLE", "arpitahujaa").lstrip("@"),
+        target_handle=os.environ.get("X_AGENT_TARGET_HANDLE", "bruhwhat4110").lstrip("@"),
         keyword=os.environ.get("X_AGENT_KEYWORD", "crosby").lower(),
         poll_interval_seconds=int(os.environ.get("X_AGENT_POLL_INTERVAL", "60")),
         dry_run=os.environ.get("X_AGENT_DRY_RUN", "").lower() in {"1", "true", "yes"},
