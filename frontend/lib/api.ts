@@ -29,8 +29,19 @@ async function get<T>(path: string, params?: Record<string, string>): Promise<T>
   return res.json();
 }
 
+/**
+ * Pulse v1 is Reddit-only. We pin the platform filter at the API boundary so
+ * every downstream component (feed, sidebar stats, even the realtime stream)
+ * sees only Reddit posts. Other adapters (X / Meta / TikTok) stay in the
+ * backend for v2 but never reach the frontend.
+ */
+export const FEED_PLATFORM = "reddit" as const;
+
 export async function fetchFeed(cursor?: string): Promise<FeedResponse> {
-  return get("/api/feed", cursor ? { cursor } : undefined);
+  return get("/api/feed", {
+    platform: FEED_PLATFORM,
+    ...(cursor ? { cursor } : {}),
+  });
 }
 
 export async function fetchClusters(params?: {

@@ -1,44 +1,28 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { Providers } from "./providers";
-import Link from "next/link";
+import { TopShell } from "@/components/TopShell";
 
 export const metadata: Metadata = {
-  title: "Pulse — Brand Intelligence",
-  description: "Social listening + LLMO pipeline dashboard",
+  title: "PULSE — brand intelligence terminal",
+  description:
+    "Social listening + LLM Optimization. What the open web and AI models actually say about your brand.",
 };
-
-const NAV = [
-  { href: "/dashboard", label: "Dashboard" },
-  { href: "/feed",      label: "Live Feed" },
-  { href: "/clusters",  label: "Clusters" },
-  { href: "/queue",     label: "Priority Queue" },
-  { href: "/llmo",      label: "LLMO" },
-  { href: "/actions",   label: "Actions" },
-];
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="en">
-      <body className="min-h-screen bg-gray-50 text-gray-900 antialiased">
+    <html lang="en" className="dark">
+      <head>
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossOrigin="" />
+        <link
+          href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght,SOFT,WONK@9..144,400;9..144,500;9..144,600;9..144,700;9..144,900&family=JetBrains+Mono:wght@400;500;600&family=Manrope:wght@300;400;500;600;700&display=swap"
+          rel="stylesheet"
+        />
+      </head>
+      <body className="min-h-screen bg-ink-950 text-paper antialiased">
         <Providers>
-          <header className="bg-white border-b border-gray-200 sticky top-0 z-30">
-            <div className="max-w-7xl mx-auto px-4 flex items-center gap-6 h-14">
-              <span className="font-bold text-indigo-600 text-lg tracking-tight">Pulse</span>
-              <nav className="flex gap-1">
-                {NAV.map(({ href, label }) => (
-                  <Link
-                    key={href}
-                    href={href}
-                    className="px-3 py-1.5 rounded-md text-sm font-medium text-gray-600 hover:bg-gray-100 hover:text-gray-900 transition-colors"
-                  >
-                    {label}
-                  </Link>
-                ))}
-              </nav>
-            </div>
-          </header>
-          <main className="max-w-7xl mx-auto px-4 py-8">{children}</main>
+          <TopShell>{children}</TopShell>
         </Providers>
       </body>
     </html>

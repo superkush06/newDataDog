@@ -1,11 +1,29 @@
 "use client";
+import { useState } from "react";
+import clsx from "clsx";
 import { useActions } from "@/hooks/useActions";
 import { ActionCard } from "@/components/ActionCard";
 import { GroundTruthDriftCard } from "@/components/GroundTruthDriftCard";
+import { SectionHeader } from "@/components/SectionHeader";
+import { PageState } from "@/components/PageState";
 import type { ActionType } from "@/lib/types";
-import { useState } from "react";
 
-const TYPES: ActionType[] = ["response", "ticket", "escalation", "faq", "insight", "dm", "ground_truth_correction"];
+const TYPES: { val: ActionType | ""; label: string }[] = [
+  { val: "",           label: "all" },
+  { val: "response",   label: "response" },
+  { val: "ticket",     label: "ticket" },
+  { val: "escalation", label: "escalation" },
+  { val: "ground_truth_correction", label: "correction" },
+  { val: "insight",    label: "insight" },
+];
+
+const STATES: { val: string; label: string }[] = [
+  { val: "pending",  label: "pending" },
+  { val: "approved", label: "approved" },
+  { val: "executed", label: "executed" },
+  { val: "rejected", label: "rejected" },
+  { val: "",         label: "all" },
+];
 
 export default function ActionsPage() {
   const [typeFilter, setTypeFilter] = useState<ActionType | "">("");
@@ -16,53 +34,92 @@ export default function ActionsPage() {
     state: stateFilter || undefined,
   });
 
-  if (isLoading) return <div className="text-gray-400 text-sm">Loading actions…</div>;
-  if (error || !data) return <div className="text-red-500 text-sm">Failed to load actions.</div>;
+  if (isLoading) return <PageState>Loading actions…</PageState>;
+  if (error || !data) return <PageState tone="alarm">Failed to load actions.</PageState>;
 
   return (
-    <div className="space-y-6">
-      <div className="flex items-center gap-4 flex-wrap">
-        <h1 className="text-2xl font-bold text-gray-900">Actions</h1>
-        <span className="text-sm text-gray-400">{data.total} total</span>
+    <div className="space-y-10">
+      <header className="rise">
+        <div className="eyebrow mb-2">VOL. 01 · SECTION 06 · ACTIONS</div>
+        <h1 className="font-display font-black text-paper text-5xl md:text-6xl leading-[0.95] tracking-tight">
+          Drafts awaiting<br />your sign-off
+        </h1>
+        <p className="mt-3 text-paper-dim max-w-2xl">
+          Pulse never posts on your behalf without approval. Every response,
+          ticket, escalation, and ground-truth correction lands here first.
+        </p>
+      </header>
 
-        <div className="ml-auto flex gap-2">
-          <select
-            value={stateFilter}
-            onChange={(e) => setStateFilter(e.target.value)}
-            className="text-sm border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-          >
-            <option value="">All states</option>
-            <option value="pending">Pending</option>
-            <option value="approved">Approved</option>
-            <option value="executed">Executed</option>
-            <option value="rejected">Rejected</option>
-          </select>
-          <select
-            value={typeFilter}
-            onChange={(e) => setTypeFilter(e.target.value as ActionType | "")}
-            className="text-sm border border-gray-300 rounded px-3 py-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-          >
-            <option value="">All types</option>
-            {TYPES.map((t) => (
-              <option key={t} value={t}>{t.replace(/_/g, " ")}</option>
-            ))}
-          </select>
-        </div>
-      </div>
+      <SectionHeader
+        eyebrow="01"
+        title={`${data.total} action${data.total === 1 ? "" : "s"}`}
+        caption="Filter by status and type."
+        right={
+          <div className="flex gap-3 flex-wrap mb-2">
+            <Group label="STATE">
+              {STATES.map((s) => (
+                <Pill key={s.val} active={stateFilter === s.val} onClick={() => setStateFilter(s.val)}>
+                  {s.label}
+                </Pill>
+              ))}
+            </Group>
+            <Group label="TYPE">
+              {TYPES.map((t) => (
+                <Pill key={t.val} active={typeFilter === t.val} onClick={() => setTypeFilter(t.val as ActionType | "")}>
+                  {t.label}
+                </Pill>
+              ))}
+            </Group>
+          </div>
+        }
+      />
 
       {data.actions.length === 0 ? (
-        <p className="text-gray-400 text-sm">No actions found.</p>
+        <div className="ink-glass rounded-sm p-8 text-center">
+          <p className="font-display text-xl text-paper">No actions match these filters</p>
+        </div>
       ) : (
-        <div className="space-y-4">
-          {data.actions.map((action) =>
-            action.type === "ground_truth_correction" ? (
-              <GroundTruthDriftCard key={action.id} action={action} />
-            ) : (
-              <ActionCard key={action.id} action={action} />
-            )
-          )}
+        <div className="space-y-3">
+          {data.actions.map((action, i) => (
+            <div key={action.id} className="rise" style={{ animationDelay: `${i * 40}ms` }}>
+              {action.type === "ground_truth_correction" ? (
+                <GroundTruthDriftCard action={action} />
+              ) : (
+                <ActionCard action={action} />
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>
+  );
+}
+
+function Group({ label, children }: { label: string; children: React.ReactNode }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <span className="eyebrow text-[10px]">{label}</span>
+      <div className="flex gap-1">{children}</div>
+    </div>
+  );
+}
+
+function Pill({
+  active, onClick, children,
+}: {
+  active: boolean; onClick: () => void; children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={onClick}
+      className={clsx(
+        "px-2.5 py-1 font-mono text-[10px] tracking-terminal border transition-colors lowercase",
+        active
+          ? "border-signal text-signal bg-signal/10"
+          : "border-ink-600 text-paper-mute hover:border-paper-dim hover:text-paper",
+      )}
+    >
+      {children}
+    </button>
   );
 }
