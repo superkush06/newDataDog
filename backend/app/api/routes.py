@@ -113,8 +113,9 @@ async def feed(
     rows = (
         await ch().query(
             f"""
-            SELECT id, platform, platform_post_id, author_handle, text, permalink,
-                   posted_at, ingested_at, sentiment, cluster_id
+            SELECT id, platform, platform_post_id, author_handle,
+                   author_follower_count, text, media_urls, likes, shares, comments,
+                   permalink, posted_at, ingested_at, sentiment, cluster_id
             FROM posts FINAL
             WHERE {' AND '.join(where)}
             ORDER BY ingested_at DESC
@@ -128,14 +129,19 @@ async def feed(
             {
                 "id": str(row[0]),
                 "platform": row[1],
-                "external_id": row[2],
+                "platform_post_id": row[2],
                 "author_handle": row[3],
-                "text": row[4],
-                "url": row[5],
-                "posted_at": row[6].isoformat() if row[6] else None,
-                "ingested_at": row[7].isoformat() if row[7] else None,
-                "sentiment": row[8],
-                "cluster_id": str(row[9]) if row[9] else None,
+                "author_follower_count": int(row[4] or 0),
+                "text": row[5],
+                "media_urls": list(row[6] or []),
+                "likes": int(row[7] or 0),
+                "shares": int(row[8] or 0),
+                "comments": int(row[9] or 0),
+                "permalink": row[10],
+                "posted_at": row[11].isoformat() if row[11] else None,
+                "ingested_at": row[12].isoformat() if row[12] else None,
+                "sentiment": row[13],
+                "cluster_id": str(row[14]) if row[14] else None,
             }
             for row in rows
         ],
