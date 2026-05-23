@@ -90,8 +90,7 @@ async def _generate(action_type: str, brand: dict, cluster: dict, posts: list) -
 
 async def run_correction(brand_id: str, audit_ids: list[str]):
     """Generate a ground_truth_correction draft from drifted LLMO audits."""
-    from app.core.llm import _get_client
-    from google.genai import types as _types
+    from app.core.llm import _get_client, DRAFT_MODEL
 
     async with pool.acquire() as conn:
         brand = await conn.fetchrow(
@@ -115,11 +114,12 @@ async def run_correction(brand_id: str, audit_ids: list[str]):
         "(LinkedIn post, AI feedback form, brand-page update). Focus on the "
         "specific inaccuracies. Be calm and factual."
     )
-    resp = await client.aio.models.generate_content(
-        model="gemini-1.5-pro", contents=prompt,
-        config=_types.GenerateContentConfig(max_output_tokens=400),
+    resp = await client.chat.completions.create(
+        model=DRAFT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=400,
     )
-    text = (resp.text or "").strip()
+    text = (resp.choices[0].message.content or "").strip()
 
     async with pool.acquire() as conn:
         cluster_id = await conn.fetchval(

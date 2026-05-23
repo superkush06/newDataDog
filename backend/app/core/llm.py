@@ -1,18 +1,45 @@
-"""Google DeepMind / Gemini wrappers — embed, classify, summarize, draft."""
+"""LLM + embedding wrappers.
+
+Generation: Groq (free-tier-friendly, OpenAI-compatible API).
+- llama-3.1-8b-instant: sentiment classification + LLMO judge pass (cheap, fast)
+- llama-3.3-70b-versatile: cluster summary + brand-voice response drafting (quality)
+
+Embeddings: local sentence-transformers (no API, no rate limits).
+- all-MiniLM-L6-v2 (384-dim, ~80MB) — first call downloads the model.
+"""
 import json
-from google import genai
-from google.genai import types
+from groq import AsyncGroq
+
 from app.config import settings
 
 _client = None
+_embedder = None
+
+# Models in one place so the swap is editable from here
+SENTIMENT_MODEL = "llama-3.1-8b-instant"
+JUDGE_MODEL = "llama-3.1-8b-instant"
+SUMMARY_MODEL = "llama-3.3-70b-versatile"
+DRAFT_MODEL = "llama-3.3-70b-versatile"
+EMBED_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
-def _get_client():
+def _get_client() -> AsyncGroq:
     global _client
     if _client is None:
-        _client = genai.Client(api_key=settings.gemini_api_key)
+        _client = AsyncGroq(api_key=settings.groq_api_key)
     return _client
 
+
+def _get_embedder():
+    """Lazy-load sentence-transformers (one-time HF download on first call)."""
+    global _embedder
+    if _embedder is None:
+        from sentence_transformers import SentenceTransformer
+        _embedder = SentenceTransformer(EMBED_MODEL)
+    return _embedder
+
+
+# ---------- prompt builders (pure; covered by tests) -------------------------
 
 def build_summary_prompt(texts: list[str]) -> str:
     head = (
@@ -36,38 +63,41 @@ def build_draft_prompt(brand: dict, cluster: dict, post_text: str, char_limit: i
     )
 
 
+# ---------- Groq calls --------------------------------------------------------
+
 async def embed_batch(texts: list[str]) -> list[list[float]]:
-    """text-embedding-004 → 768-dim vectors, batched."""
-    client = _get_client()
-    resp = await client.aio.models.embed_content(
-        model="text-embedding-004", contents=texts,
-    )
-    return [e.values for e in resp.embeddings]
+    """384-dim vectors via local sentence-transformers. Returns plain Python lists."""
+    model = _get_embedder()
+    arr = model.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+    return arr.tolist()
 
 
 async def classify_sentiment(text: str) -> str:
     client = _get_client()
-    resp = await client.aio.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=(
-            "Classify this customer post as positive, negative, neutral, "
-            "or question. Return only the label.\n\n" + text
-        ),
-        config=types.GenerateContentConfig(max_output_tokens=4, temperature=0),
+    resp = await client.chat.completions.create(
+        model=SENTIMENT_MODEL,
+        messages=[{
+            "role": "user",
+            "content": ("Classify this customer post as positive, negative, neutral, "
+                        "or question. Return only the label.\n\n" + text),
+        }],
+        max_tokens=4,
+        temperature=0,
     )
-    label = (resp.text or "").strip().lower()
+    label = (resp.choices[0].message.content or "").strip().lower().strip(".")
     return label if label in {"positive", "negative", "neutral", "question"} else "neutral"
 
 
 async def summarize_cluster(texts: list[str]) -> tuple[str, str, list[str]]:
     client = _get_client()
-    resp = await client.aio.models.generate_content(
-        model="gemini-1.5-pro",
-        contents=build_summary_prompt(texts),
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    resp = await client.chat.completions.create(
+        model=SUMMARY_MODEL,
+        messages=[{"role": "user", "content": build_summary_prompt(texts)}],
+        response_format={"type": "json_object"},
+        max_tokens=500,
     )
     try:
-        d = json.loads(resp.text)
+        d = json.loads(resp.choices[0].message.content or "{}")
         return d.get("name", "Untitled"), d.get("summary", ""), d.get("tags", [])
     except Exception:
         return "Untitled", "", []
@@ -75,15 +105,16 @@ async def summarize_cluster(texts: list[str]) -> tuple[str, str, list[str]]:
 
 async def draft_response(brand: dict, cluster: dict, post_text: str, char_limit: int) -> str:
     client = _get_client()
-    resp = await client.aio.models.generate_content(
-        model="gemini-1.5-pro",
-        contents=build_draft_prompt(brand, cluster, post_text, char_limit),
+    resp = await client.chat.completions.create(
+        model=DRAFT_MODEL,
+        messages=[{"role": "user", "content": build_draft_prompt(brand, cluster, post_text, char_limit)}],
+        max_tokens=400,
     )
-    return (resp.text or "").strip()
+    return (resp.choices[0].message.content or "").strip()
 
 
 async def classify_action_type(cluster: dict, top_posts: list) -> str:
-    """Cheap rule first; LLM only if ambiguous."""
+    """Cheap rule first; reserve LLM calls for higher-stakes ambiguity later."""
     neg = sum(1 for p in top_posts if len(p) > 7 and "negative" in (p[7] or ""))
     thresholds = cluster.get("thresholds") or {"critical": 700}
     if (cluster.get("severity_score") or 0) >= thresholds.get("critical", 700):

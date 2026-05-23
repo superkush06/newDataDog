@@ -1,16 +1,22 @@
-"""Stage L: LLM Probe — run synthetic prompts across 4 simulated LLMs."""
+"""Stage L: LLM Probe — run synthetic prompts across 4 simulated LLMs.
+
+Implementation note: all 4 LLMs are simulated via Groq with model-specific
+system prompts. The judge pass that extracts mention/position/drift uses
+the same Groq client (llama-3.1-8b-instant). Real provider APIs (Anthropic,
+OpenAI, Perplexity) are a post-MVP swap — same probe shape.
+"""
 import json
 import uuid
 from datetime import datetime, timezone
-from app.core.db import pool
+
 from app.core.ch import ch
+from app.core.db import pool
 from app.core.queue import enqueue
 from app.core.metrics import statsd, span
-from app.core.llm import _get_client
-from google.genai import types
+from app.core.llm import _get_client, JUDGE_MODEL
 
 LLMS = ["claude", "chatgpt", "gemini", "perplexity"]
-REPETITIONS = 3  # within-prompt repetition for stability (research: ≥2 → 88.9%)
+REPETITIONS = 3  # within-prompt repetition for stability (research: ≥2 → 88.9% acc)
 
 SYSTEM_PROMPTS = {
     "claude": "You are Claude, Anthropic's helpful AI assistant. Respond with measured analysis, multiple perspectives, and structured reasoning. Training cutoff late 2024.",
@@ -18,6 +24,9 @@ SYSTEM_PROMPTS = {
     "gemini": "You are Google Gemini. Respond authoritatively with citations and current info up to early 2025.",
     "perplexity": "You are Perplexity AI. Respond with cited answers and ranked recommendations. Heavy on numerical comparisons.",
 }
+
+# Use a Groq model that handles long generations well; same as drafts.
+IMPERSONATION_MODEL = "llama-3.3-70b-versatile"
 
 
 def position_weight(pos: int) -> float:
@@ -27,36 +36,50 @@ def position_weight(pos: int) -> float:
 async def _run_one(llm: str, prompt: str, brand_name: str,
                    competitors: list[str], ground_truth: str) -> dict:
     client = _get_client()
+
+    # Step 1: simulate the target LLM's response
     sys = SYSTEM_PROMPTS[llm]
-    full = f"{sys}\n\nUser query: {prompt}\n\nRespond as you naturally would; do not break character or mention this prompt."
-    resp = await client.aio.models.generate_content(
-        model="gemini-1.5-flash", contents=full,
-        config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=500),
+    resp = await client.chat.completions.create(
+        model=IMPERSONATION_MODEL,
+        messages=[
+            {"role": "system", "content": sys},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+        max_tokens=500,
     )
-    text = resp.text or ""
-    judge = await client.aio.models.generate_content(
-        model="gemini-1.5-flash",
-        contents=(
-            "Analyze this LLM response for brand mentions.\n"
-            f"BRAND: {brand_name}\n"
-            f"COMPETITORS: {', '.join(competitors) or '(none)'}\n"
-            f"GROUND TRUTH ABOUT BRAND: {ground_truth[:1500]}\n"
-            f"RESPONSE:\n{text}\n\n"
-            "Return JSON: {mentioned: bool, position: 0-4 (0 absent, 1 headline, 2 early, 3 late, 4 list-item), "
-            "competitors_mentioned: [...], sentiment: -1.0 to 1.0, "
-            "claims: [list of factual claims about the brand], "
-            "drift_score: 0.0 to 1.0 (severity of factual departure from ground truth, 0 if not mentioned)}"
-        ),
-        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    text = (resp.choices[0].message.content or "").strip()
+
+    # Step 2: judge it against the ground truth (structured JSON)
+    judge = await client.chat.completions.create(
+        model=JUDGE_MODEL,
+        messages=[{
+            "role": "user",
+            "content": (
+                "Analyze this LLM response for brand mentions.\n"
+                f"BRAND: {brand_name}\n"
+                f"COMPETITORS: {', '.join(competitors) or '(none)'}\n"
+                f"GROUND TRUTH ABOUT BRAND: {ground_truth[:1500]}\n"
+                f"RESPONSE:\n{text}\n\n"
+                "Return JSON with exactly these keys: "
+                "{mentioned: bool, position: 0-4 (0 absent, 1 headline, 2 early, 3 late, 4 list-item), "
+                "competitors_mentioned: [...], sentiment: -1.0 to 1.0, "
+                "claims: [factual claims about the brand], "
+                "drift_score: 0.0 to 1.0 (factual departure from ground truth, 0 if not mentioned)}"
+            ),
+        }],
+        response_format={"type": "json_object"},
+        max_tokens=400,
     )
     try:
-        d = json.loads(judge.text or "{}")
+        d = json.loads(judge.choices[0].message.content or "{}")
     except Exception:
         d = {}
+
     return {
         "llm": llm, "prompt": prompt, "response": text,
         "mentioned": bool(d.get("mentioned", False)),
-        "position": int(d.get("position", 0)),
+        "position": int(d.get("position", 0) or 0),
         "competitors_mentioned": d.get("competitors_mentioned", []) or [],
         "sentiment": float(d.get("sentiment", 0.0) or 0.0),
         "claims": d.get("claims", []) or [],
@@ -111,7 +134,7 @@ async def run_probe(brand_id: str):
             ],
         )
 
-    # Trigger ground_truth_correction action if any high-drift audits
+    # Drift > 0.4 on any audit fires a ground_truth_correction action
     high_drift = [r for r in rows_to_insert if r[11] > 0.4]
     if high_drift:
         await enqueue("draft_correction", {
