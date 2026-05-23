@@ -13,9 +13,16 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
+import urllib.parse
+import webbrowser
 
 from app.agents.x_agent.config import load_config
+
+
+def requests_quote(s: str) -> str:
+    return urllib.parse.quote(s, safe="")
 from app.agents.x_agent.context import RelevanceAnalyzer
 from app.agents.x_agent.monitor import Tweet
 from app.agents.x_agent.oembed import extract_tweet_id, fetch_tweet
@@ -39,6 +46,8 @@ def main() -> int:
                    help="skip the keyword + relevance gates")
     p.add_argument("--dry-run", action="store_true",
                    help="generate the draft but do not post")
+    p.add_argument("--approve", action="store_true",
+                   help="human-approval mode: draft + copy to clipboard + open X compose")
     args = p.parse_args()
 
     _log()
@@ -120,6 +129,28 @@ def main() -> int:
             matched_keyword=cfg.keyword, decision="skipped",
             reason="cli_dry_run", reply_text=draft, tweet_text=tweet.text,
         )
+        return 0
+
+    # Human-approval mode: copy draft to clipboard + open X compose window.
+    # Lets us demo the full pipeline without the X Free-tier write paywall.
+    if args.approve:
+        try:
+            subprocess.run(["pbcopy"], input=draft.encode(), check=True)
+            log.info("✓ draft copied to clipboard")
+        except (subprocess.SubprocessError, FileNotFoundError) as exc:
+            log.warning("clipboard copy failed (%s) — paste manually", exc)
+        compose_url = (
+            f"https://x.com/intent/tweet?in_reply_to={tweet.id}"
+            f"&text={requests_quote(draft)}"
+        )
+        log.info("opening compose window in browser")
+        webbrowser.open(compose_url)
+        store.record(
+            tweet_id=tweet.id, author_handle=tweet.author_handle,
+            matched_keyword=cfg.keyword, decision="skipped",
+            reason="awaiting_human_approval", reply_text=draft, tweet_text=tweet.text,
+        )
+        log.info("→ paste from clipboard if not pre-filled, click Reply")
         return 0
 
     result = XPoster(cfg).reply(in_reply_to_tweet_id=tweet.id, text=draft)

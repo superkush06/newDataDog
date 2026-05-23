@@ -5,6 +5,7 @@ import { ScoringMethod } from "@/components/ScoringMethod";
 import { LLMVisibilityGrid } from "@/components/LLMVisibilityGrid";
 import { SectionHeader } from "@/components/SectionHeader";
 import { PageState } from "@/components/PageState";
+import { XAgentPanel } from "@/components/XAgentPanel";
 
 export default function DashboardPage() {
   const { data, isLoading, error } = useScores();
@@ -104,6 +105,8 @@ export default function DashboardPage() {
       </section>
 
       <ScoringMethod />
+
+      <XAgentPanel />
 
       <section>
         <SectionHeader

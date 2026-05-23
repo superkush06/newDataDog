@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api import llmo_routes, routes, scores_route, webhooks, websocket
+from app.api import llmo_routes, routes, scores_route, webhooks, websocket, x_agent_route
 from app.core import ch as ch_module
 from app.core import db as db_module
 
@@ -50,6 +50,7 @@ app.include_router(webhooks.router, prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(routes.router, prefix="/api", tags=["api"])
 app.include_router(scores_route.router, prefix="/api", tags=["scores"])
 app.include_router(llmo_routes.router, prefix="/api", tags=["llmo"])
+app.include_router(x_agent_route.router, prefix="/api", tags=["x_agent"])
 app.include_router(websocket.router, tags=["websocket"])
 
 
