@@ -17,6 +17,19 @@ import json
 import os
 import uuid
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+# Load global .env at repo root + ensure macOS Python uses certifi CA bundle.
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+if not os.environ.get("SSL_CERT_FILE"):
+    try:
+        import certifi
+        os.environ["SSL_CERT_FILE"] = certifi.where()
+        os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
+    except ImportError:
+        pass
 
 # ---------------------------------------------------------------------------
 # Brand config
@@ -373,12 +386,5 @@ async def main() -> dict:
 
 
 if __name__ == "__main__":
-    # Load .env from repo root (two levels up from backend/scripts/)
-    from pathlib import Path
-    env_file = Path(__file__).resolve().parents[2] / ".env"
-    if env_file.exists():
-        from dotenv import load_dotenv
-        load_dotenv(env_file)
-
     result = asyncio.run(main())
     print("\n" + json.dumps(result, indent=2))
