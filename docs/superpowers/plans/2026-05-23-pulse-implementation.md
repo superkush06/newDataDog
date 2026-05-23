@@ -3351,3 +3351,1376 @@ Plan complete and saved to `docs/superpowers/plans/2026-05-23-pulse-implementati
 2. **Inline Execution** — execute tasks in this session using executing-plans, batch checkpoints.
 
 Which approach?
+
+---
+
+# LLMO Addendum (Tasks 34–43)
+
+> **Added 2026-05-23.** First-class LLMO subsystem per spec §A. New tasks slot in alongside existing tracks per the ownership map below.
+
+## Updated Worktree Partition
+
+| Track | Branch | Owns (delta) | New tasks |
+|---|---|---|---|
+| **1 — Engine** | `track-1-engine` | `backend/app/pipeline/llmo.py`, `backend/app/pipeline/llmo_scoring.py`, `backend/app/pipeline/brand_scoring.py` | 34, 35, 36, 37 |
+| **2 — Surface** | `track-2-surface` | `backend/app/api/llmo_routes.py`, `backend/app/api/scores_route.py`, `backend/migrations/003_llmo.sql`, `backend/scripts/seed_llmo.py` | 38, 39, 40 |
+| **3 — Frontend** | `track-3-frontend` | `frontend/app/dashboard/page.tsx`, `frontend/app/llmo/page.tsx`, `frontend/components/{ScoreHero,LLMVisibilityGrid,PromptResults,GroundTruthDriftCard}.tsx`, `frontend/hooks/{useScores,useLLMOAudits}.ts` | 41, 42, 43 |
+
+`backend/migrations/003_llmo.sql` is added on `main` first (Task 34) so all worktrees inherit it.
+
+---
+
+## Task 34: Migration — `llmo_audits` + brand_prompts + brands.ground_truth (on main, before worktrees)
+
+**Files:**
+- Create: `backend/migrations/003_llmo.sql`
+- Modify: `backend/scripts/apply_migrations.py` (add to applied list)
+
+- [ ] **Step 1: Write `backend/migrations/003_llmo.sql`**
+
+```sql
+-- ClickHouse part — applied by apply_migrations.py when --target=clickhouse
+-- (see scripts/apply_migrations.py: 003 is detected by filename suffix)
+CREATE TABLE IF NOT EXISTS llmo_audits (
+    id                    UUID,
+    brand_id              UUID,
+    llm                   LowCardinality(String),
+    prompt                String,
+    prompt_id             UUID,
+    response              String,
+    mentioned             UInt8,
+    position              UInt8,
+    competitors_mentioned Array(String),
+    sentiment             Float32,
+    claims                Array(String),
+    drift_score           Float32,
+    citation_accuracy     Float32,
+    ingested_at           DateTime64(3, 'UTC') DEFAULT now64()
+)
+ENGINE = MergeTree
+ORDER BY (brand_id, llm, ingested_at);
+```
+
+And the Postgres counterpart goes in `004_postgres_llmo.sql`:
+
+- [ ] **Step 2: Write `backend/migrations/004_postgres_llmo.sql`**
+
+```sql
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS ground_truth TEXT;
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS competitors TEXT[] NOT NULL DEFAULT '{}';
+
+CREATE TABLE IF NOT EXISTS brand_prompts (
+    id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    brand_id  UUID NOT NULL REFERENCES brands(id),
+    prompt    TEXT NOT NULL,
+    intent    TEXT NOT NULL DEFAULT 'discovery'
+);
+
+CREATE TABLE IF NOT EXISTS pulse_scores (
+    id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    brand_id  UUID NOT NULL REFERENCES brands(id),
+    overall   FLOAT NOT NULL,
+    social    FLOAT NOT NULL,
+    llmo      FLOAT NOT NULL,
+    breakdown JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS pulse_scores_brand_idx ON pulse_scores (brand_id, created_at DESC);
+```
+
+- [ ] **Step 3: Update `backend/scripts/apply_migrations.py` to apply both files**
+
+Replace the body of `apply_clickhouse` and `apply_postgres` so each iterates over its filename glob:
+
+```python
+async def apply_clickhouse():
+    import clickhouse_connect
+    client = await clickhouse_connect.get_async_client(
+        host=os.environ["CLICKHOUSE_HOST"],
+        port=int(os.environ.get("CLICKHOUSE_PORT", 8443)),
+        username=os.environ.get("CLICKHOUSE_USER", "default"),
+        password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
+        secure=True,
+    )
+    files = sorted(MIGRATIONS.glob("*_clickhouse.sql")) + sorted(MIGRATIONS.glob("003_llmo.sql"))
+    for f in files:
+        for stmt in [s.strip() for s in f.read_text().split(";") if s.strip()]:
+            await client.command(stmt)
+    print(f"✓ ClickHouse migrations applied ({len(files)} files)")
+
+async def apply_postgres():
+    import asyncpg
+    conn = await asyncpg.connect(os.environ["DATABASE_URL"])
+    files = sorted(MIGRATIONS.glob("*_postgres*.sql"))
+    for f in files:
+        await conn.execute(f.read_text())
+    await conn.close()
+    print(f"✓ Postgres migrations applied ({len(files)} files)")
+```
+
+- [ ] **Step 4: Commit on main**
+
+```bash
+git add backend/migrations/003_llmo.sql backend/migrations/004_postgres_llmo.sql backend/scripts/apply_migrations.py
+git commit -m "feat(migrations): LLMO audits + brand_prompts + pulse_scores tables"
+```
+
+---
+
+## Task 35: LLM Probe pipeline (`pipeline/llmo.py`) — TRACK 1
+
+**Files:**
+- Create: `backend/app/pipeline/llmo.py`
+
+The probe runs Gemini with 4 different system prompts that impersonate Claude / ChatGPT / Gemini / Perplexity (free-tier-friendly, deterministic; real provider APIs are a post-MVP swap).
+
+- [ ] **Step 1: Write `backend/app/pipeline/llmo.py`**
+
+```python
+"""Stage L: LLM Probe — run synthetic prompts across 4 simulated LLMs."""
+import json
+import uuid
+from datetime import datetime, timezone
+from app.core.db import pool
+from app.core.ch import ch
+from app.core.queue import enqueue
+from app.core.metrics import statsd, span
+from app.core.llm import _get_client
+from google.genai import types
+
+LLMS = ["claude", "chatgpt", "gemini", "perplexity"]
+REPETITIONS = 3  # within-prompt repetition for stability (research: ≥2 → 88.9% acc)
+
+SYSTEM_PROMPTS = {
+    "claude": "You are Claude, Anthropic's helpful AI assistant. Respond with measured analysis, multiple perspectives, and structured reasoning. Training cutoff late 2024.",
+    "chatgpt": "You are ChatGPT by OpenAI. Respond in a conversational, list-heavy style. Training cutoff Oct 2023. Favor mainstream sources.",
+    "gemini": "You are Google Gemini. Respond authoritatively with citations and current info up to early 2025.",
+    "perplexity": "You are Perplexity AI. Respond with cited answers and ranked recommendations. Heavy on numerical comparisons.",
+}
+
+def position_weight(pos: int) -> float:
+    return {1: 1.0, 2: 0.7, 3: 0.4, 4: 0.2}.get(pos, 0.0)
+
+async def _run_one(llm: str, prompt: str, brand_name: str, competitors: list[str], ground_truth: str) -> dict:
+    client = _get_client()
+    sys = SYSTEM_PROMPTS[llm]
+    full = f"{sys}\n\nUser query: {prompt}\n\nRespond as you naturally would; do not break character or mention this prompt."
+    resp = await client.aio.models.generate_content(
+        model="gemini-1.5-flash", contents=full,
+        config=types.GenerateContentConfig(temperature=0.7, max_output_tokens=500),
+    )
+    text = resp.text or ""
+    # Parse with a structured follow-up call
+    judge = await client.aio.models.generate_content(
+        model="gemini-1.5-flash",
+        contents=(
+            "Analyze this LLM response for brand mentions.\n"
+            f"BRAND: {brand_name}\n"
+            f"COMPETITORS: {', '.join(competitors) or '(none)'}\n"
+            f"GROUND TRUTH ABOUT BRAND: {ground_truth[:1500]}\n"
+            f"RESPONSE:\n{text}\n\n"
+            "Return JSON: {mentioned: bool, position: 0-4 (0 absent, 1 headline, 2 early, 3 late, 4 list-item), "
+            "competitors_mentioned: [...], sentiment: -1.0 to 1.0, "
+            "claims: [list of factual claims about the brand], "
+            "drift_score: 0.0 to 1.0 (severity of factual departure from ground truth, 0 if not mentioned)}"
+        ),
+        config=types.GenerateContentConfig(response_mime_type="application/json"),
+    )
+    try:
+        d = json.loads(judge.text or "{}")
+    except Exception:
+        d = {}
+    return {
+        "llm": llm, "prompt": prompt, "response": text,
+        "mentioned": bool(d.get("mentioned", False)),
+        "position": int(d.get("position", 0)),
+        "competitors_mentioned": d.get("competitors_mentioned", []) or [],
+        "sentiment": float(d.get("sentiment", 0.0) or 0.0),
+        "claims": d.get("claims", []) or [],
+        "drift_score": float(d.get("drift_score", 0.0) or 0.0),
+    }
+
+@span("llmo.probe")
+async def run_probe(brand_id: str):
+    """One full LLM probe iteration for a brand: all prompts × all LLMs × REPETITIONS."""
+    bid = uuid.UUID(brand_id)
+    async with pool.acquire() as conn:
+        brand = await conn.fetchrow(
+            "SELECT name, ground_truth, competitors FROM brands WHERE id=$1", bid,
+        )
+        prompts = await conn.fetch(
+            "SELECT id, prompt FROM brand_prompts WHERE brand_id=$1 LIMIT 20", bid,
+        )
+    if not brand or not prompts:
+        return
+
+    competitors = list(brand["competitors"] or [])
+    ground_truth = brand["ground_truth"] or ""
+    rows_to_insert = []
+
+    for prow in prompts:
+        for llm in LLMS:
+            for _ in range(REPETITIONS):
+                r = await _run_one(llm, prow["prompt"], brand["name"], competitors, ground_truth)
+                citation_accuracy = 100.0 * (1.0 - r["drift_score"]) if r["mentioned"] else 0.0
+                rows_to_insert.append([
+                    str(uuid.uuid4()), brand_id, llm,
+                    r["prompt"], str(prow["id"]), r["response"],
+                    1 if r["mentioned"] else 0,
+                    r["position"], r["competitors_mentioned"],
+                    r["sentiment"], r["claims"],
+                    r["drift_score"], citation_accuracy,
+                    datetime.now(timezone.utc),
+                ])
+                statsd.increment(
+                    "pulse.llmo.probe",
+                    tags=[f"llm:{llm}", f"mentioned:{int(r['mentioned'])}", f"brand:{brand_id}"],
+                )
+
+    if rows_to_insert:
+        await ch().insert(
+            "llmo_audits", rows_to_insert,
+            column_names=[
+                "id","brand_id","llm","prompt","prompt_id","response",
+                "mentioned","position","competitors_mentioned","sentiment",
+                "claims","drift_score","citation_accuracy","ingested_at",
+            ],
+        )
+    await enqueue("score_recompute", {"brand_id": brand_id})
+```
+
+- [ ] **Step 2: Commit (on branch `track-1-engine`)**
+
+```bash
+git add backend/app/pipeline/llmo.py
+git commit -m "feat(llmo): LLM probe pipeline with 4-LLM impersonation + judge pass"
+```
+
+---
+
+## Task 36: LLMO scoring (`pipeline/llmo_scoring.py`) — TRACK 1, pure functions + TDD
+
+**Files:**
+- Create: `backend/app/pipeline/llmo_scoring.py`
+- Test: `backend/tests/test_llmo_scoring.py`
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# backend/tests/test_llmo_scoring.py
+from app.pipeline.llmo_scoring import (
+    compute_llmo_score, citation_frequency, share_of_voice,
+    citation_accuracy, sentiment_quality,
+)
+
+def test_citation_frequency_position_weighted():
+    audits = [
+        {"position": 1, "mentioned": True},
+        {"position": 3, "mentioned": True},
+        {"position": 0, "mentioned": False},
+    ]
+    # (1.0 + 0.4 + 0) / 3 * 100 ≈ 46.7
+    assert 46 < citation_frequency(audits) < 48
+
+def test_share_of_voice_basic():
+    audits = [
+        {"mentioned": True, "competitors_mentioned": ["A", "B"]},
+        {"mentioned": True, "competitors_mentioned": ["A"]},
+    ]
+    # 2 brand vs 3 competitor = 2/5 = 40
+    assert share_of_voice(audits) == 40.0
+
+def test_citation_accuracy_only_when_mentioned():
+    audits = [
+        {"mentioned": True, "drift_score": 0.1},
+        {"mentioned": True, "drift_score": 0.5},
+        {"mentioned": False, "drift_score": 0.0},
+    ]
+    # avg(90, 50) = 70 (ignores not-mentioned)
+    assert citation_accuracy(audits) == 70.0
+
+def test_sentiment_quality_rescaled():
+    audits = [
+        {"mentioned": True, "sentiment": 0.4},
+        {"mentioned": True, "sentiment": -0.2},
+    ]
+    # avg sentiment = 0.1; rescaled (0.1+1)/2*100 = 55
+    assert sentiment_quality(audits) == 55.0
+
+def test_compute_llmo_score_weights():
+    s = compute_llmo_score(
+        citation_freq=60, sov=40, citation_acc=70, sentiment_qual=55,
+    )
+    # 0.30*60 + 0.25*40 + 0.25*70 + 0.20*55 = 18 + 10 + 17.5 + 11 = 56.5
+    assert s == 56.5
+```
+
+- [ ] **Step 2: Write `backend/app/pipeline/llmo_scoring.py`**
+
+```python
+"""Pure LLMO scoring. No I/O."""
+from typing import Iterable, Mapping
+
+POSITION_WEIGHTS = {1: 1.0, 2: 0.7, 3: 0.4, 4: 0.2, 0: 0.0}
+
+def citation_frequency(audits: Iterable[Mapping]) -> float:
+    audits = list(audits)
+    if not audits:
+        return 0.0
+    weights = [POSITION_WEIGHTS.get(a.get("position", 0), 0.0) for a in audits]
+    return sum(weights) / len(audits) * 100.0
+
+def share_of_voice(audits: Iterable[Mapping]) -> float:
+    brand_mentions = 0
+    competitor_mentions = 0
+    for a in audits:
+        if a.get("mentioned"):
+            brand_mentions += 1
+        competitor_mentions += len(a.get("competitors_mentioned") or [])
+    total = brand_mentions + competitor_mentions
+    if total == 0:
+        return 0.0
+    return brand_mentions / total * 100.0
+
+def citation_accuracy(audits: Iterable[Mapping]) -> float:
+    drifts = [a.get("drift_score", 0.0) for a in audits if a.get("mentioned")]
+    if not drifts:
+        return 0.0
+    return sum(100.0 * (1.0 - d) for d in drifts) / len(drifts)
+
+def sentiment_quality(audits: Iterable[Mapping]) -> float:
+    sents = [a.get("sentiment", 0.0) for a in audits if a.get("mentioned")]
+    if not sents:
+        return 50.0  # neutral default
+    avg = sum(sents) / len(sents)
+    return (avg + 1.0) / 2.0 * 100.0
+
+def compute_llmo_score(citation_freq: float, sov: float,
+                       citation_acc: float, sentiment_qual: float) -> float:
+    return round(
+        0.30 * citation_freq
+        + 0.25 * sov
+        + 0.25 * citation_acc
+        + 0.20 * sentiment_qual,
+        2,
+    )
+```
+
+- [ ] **Step 3: Run tests**
+
+```bash
+pytest tests/test_llmo_scoring.py -v
+```
+Expected: 5 passed.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add backend/app/pipeline/llmo_scoring.py backend/tests/test_llmo_scoring.py
+git commit -m "feat(llmo): pure LLMO scoring formulas + TDD"
+```
+
+---
+
+## Task 37: Brand-level scoring (`pipeline/brand_scoring.py`) — TRACK 1
+
+Computes the brand-level Social + LLMO + Overall snapshot from ClickHouse aggregations and persists to `pulse_scores`.
+
+**Files:**
+- Create: `backend/app/pipeline/brand_scoring.py`
+
+- [ ] **Step 1: Write `backend/app/pipeline/brand_scoring.py`**
+
+```python
+"""Brand-level rollup: SocialScore + LLMOScore + Overall."""
+import json
+import uuid
+from app.core.db import pool
+from app.core.ch import ch
+from app.core.metrics import statsd, span
+from app.pipeline.llmo_scoring import (
+    citation_frequency, share_of_voice, citation_accuracy,
+    sentiment_quality, compute_llmo_score,
+)
+
+LLMS = ["claude", "chatgpt", "gemini", "perplexity"]
+
+def drift_label(citation_acc: float) -> str:
+    if citation_acc >= 80: return "low"
+    if citation_acc >= 50: return "medium"
+    return "high"
+
+@span("brand_scoring.recompute")
+async def recompute(brand_id: str) -> dict:
+    bid = uuid.UUID(brand_id)
+
+    # --- SocialScore ---
+    async with pool.acquire() as conn:
+        sev_rows = await conn.fetch(
+            """
+            SELECT severity, count(*) AS n FROM clusters
+            WHERE brand_id=$1 AND status='active'
+              AND last_activity_at > now() - INTERVAL '24 hours'
+            GROUP BY severity
+            """, bid,
+        )
+    sev_counts = {r["severity"]: r["n"] for r in sev_rows}
+    pressure = (sev_counts.get("critical", 0) * 30
+                + sev_counts.get("high", 0) * 15
+                + sev_counts.get("medium", 0) * 5)
+    social = max(0.0, min(100.0, 100.0 - pressure))
+
+    # --- LLMOScore ---
+    audits_rows = (await ch().query(
+        """
+        SELECT llm, mentioned, position, competitors_mentioned,
+               sentiment, drift_score
+        FROM llmo_audits
+        WHERE brand_id = %(b)s AND ingested_at > now() - INTERVAL 24 HOUR
+        """,
+        {"b": brand_id},
+    )).result_rows
+
+    audits = [{
+        "llm": r[0], "mentioned": bool(r[1]), "position": int(r[2]),
+        "competitors_mentioned": list(r[3] or []),
+        "sentiment": float(r[4]), "drift_score": float(r[5]),
+    } for r in audits_rows]
+
+    cf = citation_frequency(audits)
+    sov = share_of_voice(audits)
+    ca = citation_accuracy(audits)
+    sq = sentiment_quality(audits)
+    llmo = compute_llmo_score(cf, sov, ca, sq)
+
+    per_llm = {}
+    for llm in LLMS:
+        ll_audits = [a for a in audits if a["llm"] == llm]
+        if not ll_audits:
+            per_llm[llm] = {"score": 0.0, "mention_rate": 0.0,
+                            "avg_position": 0.0, "drift": "high"}
+            continue
+        mr = sum(1 for a in ll_audits if a["mentioned"]) / len(ll_audits) * 100
+        positions = [a["position"] for a in ll_audits if a["mentioned"]]
+        avg_pos = sum(positions) / len(positions) if positions else 0
+        l_ca = citation_accuracy(ll_audits)
+        l_score = compute_llmo_score(
+            citation_frequency(ll_audits), share_of_voice(ll_audits),
+            l_ca, sentiment_quality(ll_audits),
+        )
+        per_llm[llm] = {"score": l_score, "mention_rate": round(mr, 1),
+                        "avg_position": round(avg_pos, 2),
+                        "drift": drift_label(l_ca)}
+
+    overall = round(0.5 * social + 0.5 * llmo, 2)
+
+    breakdown = {
+        "social_breakdown": {
+            "critical_clusters": sev_counts.get("critical", 0),
+            "high_clusters": sev_counts.get("high", 0),
+            "medium_clusters": sev_counts.get("medium", 0),
+        },
+        "llmo_breakdown": {
+            "citation_frequency": round(cf, 2),
+            "share_of_voice": round(sov, 2),
+            "citation_accuracy": round(ca, 2),
+            "sentiment_quality": round(sq, 2),
+            "per_llm": per_llm,
+        },
+    }
+
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO pulse_scores (brand_id, overall, social, llmo, breakdown) "
+            "VALUES ($1,$2,$3,$4,$5::jsonb)",
+            bid, overall, social, llmo, json.dumps(breakdown),
+        )
+
+    statsd.gauge("pulse.brand.overall", overall, tags=[f"brand:{brand_id}"])
+    statsd.gauge("pulse.brand.social", social, tags=[f"brand:{brand_id}"])
+    statsd.gauge("pulse.brand.llmo", llmo, tags=[f"brand:{brand_id}"])
+
+    return {"overall": overall, "social": social, "llmo": llmo, **breakdown}
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add backend/app/pipeline/brand_scoring.py
+git commit -m "feat(brand): brand-level Social+LLMO+Overall rollup with per-LLM detail"
+```
+
+---
+
+## Task 38: `/api/scores` + `/api/llmo/audits` + `/api/llmo/probe` routes — TRACK 2
+
+**Files:**
+- Create: `backend/app/api/scores_route.py`
+- Create: `backend/app/api/llmo_routes.py`
+- Modify: `backend/app/main.py` (mount new routers)
+- Modify: `backend/app/workers/pipeline_worker.py` (add `score_recompute` + `llmo_probe` jobs)
+
+- [ ] **Step 1: Write `backend/app/api/scores_route.py`**
+
+```python
+"""Brand-level score endpoint."""
+import uuid
+from fastapi import APIRouter, Query, HTTPException
+from app.core.db import pool
+from app.pipeline.brand_scoring import recompute
+
+router = APIRouter()
+
+@router.get("/scores")
+async def scores(brand_id: str = Query(...), recompute_now: bool = False):
+    bid = uuid.UUID(brand_id)
+    if recompute_now:
+        snap = await recompute(brand_id)
+    else:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT overall, social, llmo, breakdown, created_at "
+                "FROM pulse_scores WHERE brand_id=$1 "
+                "ORDER BY created_at DESC LIMIT 1", bid,
+            )
+        if not row:
+            snap = await recompute(brand_id)
+        else:
+            snap = {
+                "overall": row["overall"], "social": row["social"], "llmo": row["llmo"],
+                **(row["breakdown"] if isinstance(row["breakdown"], dict)
+                   else __import__("json").loads(row["breakdown"])),
+                "computed_at": row["created_at"].isoformat(),
+            }
+
+    # 24h sparklines (12 datapoints, 2h apart)
+    async with pool.acquire() as conn:
+        spark_rows = await conn.fetch(
+            """
+            SELECT overall, social, llmo, created_at FROM pulse_scores
+            WHERE brand_id=$1 AND created_at > now() - INTERVAL '24 hours'
+            ORDER BY created_at ASC
+            """, bid,
+        )
+    snap["sparklines"] = {
+        "overall": [r["overall"] for r in spark_rows],
+        "social":  [r["social"] for r in spark_rows],
+        "llmo":    [r["llmo"] for r in spark_rows],
+    }
+    return snap
+```
+
+- [ ] **Step 2: Write `backend/app/api/llmo_routes.py`**
+
+```python
+"""LLMO audits + manual probe trigger."""
+import uuid
+from fastapi import APIRouter, Query, HTTPException
+from app.core.ch import ch
+from app.core.queue import enqueue
+
+router = APIRouter()
+
+@router.get("/llmo/audits")
+async def audits(brand_id: str = Query(...), llm: str | None = None, limit: int = 100):
+    where = ["brand_id = %(b)s"]
+    params: dict = {"b": brand_id, "lim": limit}
+    if llm:
+        where.append("llm = %(llm)s")
+        params["llm"] = llm
+    rows = (await ch().query(
+        f"""
+        SELECT id, llm, prompt, response, mentioned, position,
+               competitors_mentioned, sentiment, claims,
+               drift_score, citation_accuracy, ingested_at
+        FROM llmo_audits WHERE {' AND '.join(where)}
+        ORDER BY ingested_at DESC LIMIT %(lim)s
+        """, params,
+    )).result_rows
+    return {"audits": [{
+        "id": str(r[0]), "llm": r[1], "prompt": r[2], "response": r[3],
+        "mentioned": bool(r[4]), "position": int(r[5]),
+        "competitors_mentioned": list(r[6] or []),
+        "sentiment": float(r[7]), "claims": list(r[8] or []),
+        "drift_score": float(r[9]), "citation_accuracy": float(r[10]),
+        "ingested_at": r[11].isoformat() if r[11] else None,
+    } for r in rows]}
+
+@router.post("/llmo/probe")
+async def trigger_probe(brand_id: str = Query(...)):
+    await enqueue("llmo_probe", {"brand_id": brand_id})
+    return {"status": "enqueued"}
+
+@router.get("/brands/{brand_id}/prompts")
+async def list_prompts(brand_id: str):
+    from app.core.db import pool
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, prompt, intent FROM brand_prompts WHERE brand_id=$1 ORDER BY intent",
+            uuid.UUID(brand_id),
+        )
+    return {"prompts": [{"id": str(r["id"]), "prompt": r["prompt"],
+                          "intent": r["intent"]} for r in rows]}
+
+@router.post("/brands/{brand_id}/prompts")
+async def add_prompt(brand_id: str, body: dict):
+    from app.core.db import pool
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "INSERT INTO brand_prompts (brand_id, prompt, intent) "
+            "VALUES ($1,$2,$3) RETURNING id",
+            uuid.UUID(brand_id), body["prompt"], body.get("intent", "discovery"),
+        )
+    return {"id": str(row["id"])}
+```
+
+- [ ] **Step 3: Update `backend/app/main.py` to mount the new routers**
+
+After the existing `app.include_router(routes.router, prefix="/api")` line, add:
+
+```python
+from app.api import scores_route, llmo_routes
+app.include_router(scores_route.router, prefix="/api")
+app.include_router(llmo_routes.router, prefix="/api")
+```
+
+- [ ] **Step 4: Update `backend/app/workers/pipeline_worker.py` to add `llmo_probe` and `score_recompute`**
+
+After the existing `act_run` function, add:
+
+```python
+async def llmo_probe(ctx, payload: dict):
+    from app.pipeline.llmo import run_probe
+    return await run_probe(payload["brand_id"])
+
+async def score_recompute(ctx, payload: dict):
+    from app.pipeline.brand_scoring import recompute
+    return await recompute(payload["brand_id"])
+```
+
+Then update `WorkerSettings.functions` to include both: `[monitor_persist, cluster_run, score_run, act_run, llmo_probe, score_recompute]`.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add backend/app/api/scores_route.py backend/app/api/llmo_routes.py \
+        backend/app/main.py backend/app/workers/pipeline_worker.py
+git commit -m "feat(api): /api/scores + /api/llmo/* routes + worker jobs"
+```
+
+---
+
+## Task 39: LLMO probe cron (every 15 min) + seed prompts — TRACK 2
+
+**Files:**
+- Modify: `backend/app/workers/cron.py` (add `run_llmo_probes`)
+- Create: `backend/scripts/seed_llmo.py`
+
+- [ ] **Step 1: Add `run_llmo_probes` to `cron.py`**
+
+```python
+# append to backend/app/workers/cron.py
+
+async def run_llmo_probes():
+    """Triggered every 15 min. Probes every brand."""
+    await init_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id FROM brands")
+    for r in rows:
+        await enqueue("llmo_probe", {"brand_id": str(r["id"])})
+
+# extend the bottom dispatch:
+if __name__ == "__main__":
+    import sys
+    fn = {
+        "poll_platforms": poll_platforms,
+        "refresh_engagement": refresh_engagement,
+        "run_llmo_probes": run_llmo_probes,
+    }[sys.argv[1]]
+    asyncio.run(fn())
+```
+
+- [ ] **Step 2: Write `backend/scripts/seed_llmo.py`**
+
+```python
+"""Seed LLMO ground truth + brand prompts + competitor list for the demo brand."""
+import asyncio
+import os
+import sys
+from dotenv import load_dotenv
+load_dotenv()
+
+CROSBY_GROUND_TRUTH = """
+Crosby is an AI-first law firm (not a software tool, not a SaaS platform).
+Founded by Ryan Daniels and John Sarihan. Series B at $60M from Sequoia, Index, and Bain.
+Focused on contract review for fast-growing startups: NDAs, MSAs, DPAs.
+Customers include Cursor, Clay, UnifyGTM. Operates with human lawyers
+supported by AI agents — paralegal-routing-agent → senior-associate-review → human-in-loop.
+Promise: contract turnaround in under an hour. Headquartered in NYC.
+NOT a software company. NOT a DIY contract tool. The firm employs licensed attorneys.
+"""
+
+CROSBY_PROMPTS = [
+    ("What is Crosby AI?", "discovery"),
+    ("Best AI legal services for startups?", "discovery"),
+    ("Alternatives to Harvey AI?", "alternative"),
+    ("Who founded Crosby AI?", "research"),
+    ("Crosby AI vs Ironclad vs EvenUp?", "comparison"),
+    ("What does Crosby do for contract review?", "discovery"),
+    ("Is Crosby a law firm or software?", "research"),
+    ("Fastest contract review service for Series A startups", "discovery"),
+    ("Which AI law firms have raised Series B?", "research"),
+    ("Crosby AI pricing and turnaround time", "research"),
+]
+
+COMPETITORS = ["Harvey AI", "Ironclad", "Robin AI", "EvenUp", "DoNotPay", "Lawgeex"]
+
+ACME_GROUND_TRUTH = """
+Acme Coffee is a specialty coffee subscription with a mobile-first checkout.
+Founded 2019. Known for ethically sourced beans and same-week roasting.
+Mobile app for iOS and Android handles ordering, subscriptions, and rewards.
+Customer support: support@acmecoffee.com. Headquartered in Portland, OR.
+"""
+
+ACME_PROMPTS = [
+    ("Best coffee subscription apps", "discovery"),
+    ("Alternatives to Trade Coffee?", "alternative"),
+    ("Acme Coffee app reviews", "research"),
+    ("Fastest coffee subscription delivery", "discovery"),
+]
+ACME_COMPETITORS = ["Trade Coffee", "Atlas Coffee", "Blue Bottle", "Counter Culture"]
+
+async def main():
+    import asyncpg
+    pg = await asyncpg.connect(os.environ["DATABASE_URL"])
+
+    target = sys.argv[1] if len(sys.argv) > 1 else "acme"
+
+    if target == "crosby":
+        bid = await pg.fetchval("""
+            INSERT INTO brands (name, vertical, voice_guidelines, keywords,
+                ground_truth, competitors)
+            VALUES ('Crosby', 'generic',
+                    'Direct, candid, confident. Talk like a senior partner.',
+                    ARRAY['crosby','crosby.ai','crosby AI','crosby law'],
+                    $1, $2)
+            ON CONFLICT DO NOTHING RETURNING id
+        """, CROSBY_GROUND_TRUTH.strip(), COMPETITORS)
+        if bid is None:
+            bid = await pg.fetchval("SELECT id FROM brands WHERE name='Crosby'")
+            await pg.execute(
+                "UPDATE brands SET ground_truth=$1, competitors=$2 WHERE id=$3",
+                CROSBY_GROUND_TRUTH.strip(), COMPETITORS, bid)
+        for p, intent in CROSBY_PROMPTS:
+            await pg.execute(
+                "INSERT INTO brand_prompts (brand_id, prompt, intent) VALUES ($1,$2,$3)",
+                bid, p, intent)
+    else:
+        bid = await pg.fetchval(
+            "SELECT id FROM brands WHERE name='Acme Coffee'"
+        )
+        if bid:
+            await pg.execute(
+                "UPDATE brands SET ground_truth=$1, competitors=$2 WHERE id=$3",
+                ACME_GROUND_TRUTH.strip(), ACME_COMPETITORS, bid)
+            for p, intent in ACME_PROMPTS:
+                await pg.execute(
+                    "INSERT INTO brand_prompts (brand_id, prompt, intent) VALUES ($1,$2,$3)",
+                    bid, p, intent)
+
+    print(f"✓ LLMO seeded for {target} (brand_id={bid})")
+    await pg.close()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add backend/app/workers/cron.py backend/scripts/seed_llmo.py
+git commit -m "feat(llmo): probe cron + Crosby/Acme ground truth + prompt seeds"
+```
+
+---
+
+## Task 40: Action type — `ground_truth_correction` — TRACK 2
+
+**Files:**
+- Modify: `backend/app/pipeline/act.py` (detect drift anomalies)
+- Modify: `backend/app/pipeline/llmo.py` (trigger ground_truth_correction on high drift)
+
+- [ ] **Step 1: At the end of `pipeline/llmo.py::run_probe`, add drift-correction trigger**
+
+After the score recompute enqueue, add:
+
+```python
+    # Drift > 0.4 on any audit fires a ground_truth_correction action
+    high_drift = [r for r in rows_to_insert if r[11] > 0.4]  # r[11] = drift_score
+    if high_drift:
+        await enqueue("draft_correction", {
+            "brand_id": brand_id,
+            "audit_ids": [r[0] for r in high_drift[:3]],  # cap to top 3
+        })
+```
+
+- [ ] **Step 2: Add `draft_correction` worker function in `pipeline_worker.py`**
+
+```python
+async def draft_correction(ctx, payload: dict):
+    from app.pipeline.act import run_correction
+    return await run_correction(payload["brand_id"], payload["audit_ids"])
+```
+
+Add to `WorkerSettings.functions`.
+
+- [ ] **Step 3: Add `run_correction` in `pipeline/act.py`**
+
+```python
+async def run_correction(brand_id: str, audit_ids: list[str]):
+    """Generate a ground_truth_correction draft from drifted audits."""
+    import json
+    import uuid
+    from app.core.ch import ch
+    from app.core.db import pool
+    from app.core.llm import _get_client
+    from google.genai import types
+
+    async with pool.acquire() as conn:
+        brand = await conn.fetchrow(
+            "SELECT id, name, ground_truth FROM brands WHERE id=$1", uuid.UUID(brand_id)
+        )
+    audits = (await ch().query(
+        "SELECT llm, prompt, response, claims, drift_score "
+        "FROM llmo_audits WHERE id IN %(ids)s",
+        {"ids": audit_ids},
+    )).result_rows
+    if not audits:
+        return
+
+    client = _get_client()
+    sample = "\n\n".join([f"[{a[0]}] {a[2][:400]}" for a in audits])
+    prompt = (
+        f"You are correcting public AI descriptions of {brand['name']}.\n\n"
+        f"GROUND TRUTH:\n{brand['ground_truth']}\n\n"
+        f"DRIFTED LLM RESPONSES:\n{sample}\n\n"
+        "Draft a single 2-3 sentence correction statement Pulse can publish "
+        "(LinkedIn post, AI feedback form, brand-page update). Focus on the "
+        "specific inaccuracies. Be calm and factual."
+    )
+    resp = await client.aio.models.generate_content(
+        model="gemini-1.5-pro", contents=prompt,
+        config=types.GenerateContentConfig(max_output_tokens=400),
+    )
+    text = (resp.text or "").strip()
+
+    # Pick a representative cluster for the FK; in MVP we use the most-recent active cluster.
+    async with pool.acquire() as conn:
+        cluster_id = await conn.fetchval(
+            "SELECT id FROM clusters WHERE brand_id=$1 AND status='active' "
+            "ORDER BY last_activity_at DESC NULLS LAST LIMIT 1", uuid.UUID(brand_id),
+        )
+        if not cluster_id:
+            # Synthesize a placeholder cluster for the correction
+            cluster_id = await conn.fetchval(
+                """
+                INSERT INTO clusters (brand_id, name, summary, severity, severity_score)
+                VALUES ($1, 'LLM Ground Truth Drift', $2, 'high', 600) RETURNING id
+                """, uuid.UUID(brand_id),
+                f"Detected drift in {len(audits)} LLM responses.",
+            )
+
+        await conn.execute(
+            """
+            INSERT INTO actions (brand_id, type, state, cluster_id, draft, context)
+            VALUES ($1,'ground_truth_correction','pending',$2,$3::jsonb,$4::jsonb)
+            """,
+            uuid.UUID(brand_id), cluster_id,
+            json.dumps({"text": text, "destinations": ["linkedin", "brand_page"],
+                         "drifted_llms": list({a[0] for a in audits})}),
+            json.dumps({"cluster_summary": "LLM drift detected",
+                         "similar_report_count": len(audits)}),
+        )
+```
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add backend/app/pipeline/act.py backend/app/pipeline/llmo.py backend/app/workers/pipeline_worker.py
+git commit -m "feat(act): ground_truth_correction action type triggered on LLM drift"
+```
+
+---
+
+## Task 41: `/dashboard` main page with ScoreHero — TRACK 3
+
+**Files:**
+- Create: `frontend/components/ScoreHero.tsx`
+- Create: `frontend/hooks/useScores.ts`
+- Create: `frontend/app/dashboard/page.tsx`
+- Modify: `frontend/app/page.tsx` (redirect → `/dashboard`)
+- Modify: `frontend/app/layout.tsx` (add Dashboard + LLMO to nav)
+- Modify: `frontend/lib/api.ts` (add scores + llmoAudits)
+- Modify: `frontend/lib/types.ts` (add ScoreSnapshot + LLMAudit)
+
+- [ ] **Step 1: Extend `frontend/lib/types.ts`**
+
+Append to the file:
+
+```typescript
+export interface PerLLMScore {
+  score: number;
+  mention_rate: number;
+  avg_position: number;
+  drift: "low" | "medium" | "high";
+}
+
+export interface ScoreSnapshot {
+  overall: number;
+  social: number;
+  llmo: number;
+  social_breakdown: {
+    critical_clusters: number;
+    high_clusters: number;
+    medium_clusters: number;
+  };
+  llmo_breakdown: {
+    citation_frequency: number;
+    share_of_voice: number;
+    citation_accuracy: number;
+    sentiment_quality: number;
+    per_llm: Record<"claude" | "chatgpt" | "gemini" | "perplexity", PerLLMScore>;
+  };
+  sparklines: { overall: number[]; social: number[]; llmo: number[] };
+  computed_at?: string;
+}
+
+export interface LLMAudit {
+  id: string;
+  llm: "claude" | "chatgpt" | "gemini" | "perplexity";
+  prompt: string;
+  response: string;
+  mentioned: boolean;
+  position: 0 | 1 | 2 | 3 | 4;
+  competitors_mentioned: string[];
+  sentiment: number;
+  claims: string[];
+  drift_score: number;
+  citation_accuracy: number;
+  ingested_at: string;
+}
+```
+
+- [ ] **Step 2: Extend `frontend/lib/api.ts`**
+
+Add to the `api` object:
+
+```typescript
+  scores: (brandId: string, recompute = false) =>
+    req<ScoreSnapshot>(`/scores?brand_id=${brandId}${recompute ? "&recompute_now=true" : ""}`),
+  llmoAudits: (brandId: string, llm?: string) =>
+    req<{ audits: LLMAudit[] }>(`/llmo/audits?brand_id=${brandId}${llm ? `&llm=${llm}` : ""}`),
+  triggerProbe: (brandId: string) =>
+    req<{ status: string }>(`/llmo/probe?brand_id=${brandId}`, { method: "POST" }),
+```
+
+And import the new types at the top:
+```typescript
+import type { ScoreSnapshot, LLMAudit } from "./types";
+```
+
+- [ ] **Step 3: Write `frontend/components/ScoreHero.tsx`**
+
+```typescript
+"use client";
+import type { ScoreSnapshot } from "@/lib/types";
+import { LineChart, Line, ResponsiveContainer } from "recharts";
+
+function band(n: number) {
+  if (n >= 80) return "text-green-500";
+  if (n >= 60) return "text-amber-500";
+  return "text-rose-500";
+}
+
+function Spark({ data, stroke }: { data: number[]; stroke: string }) {
+  const d = data.map((v, i) => ({ d: i, v }));
+  return (
+    <div className="h-10 mt-2">
+      <ResponsiveContainer>
+        <LineChart data={d}>
+          <Line type="monotone" dataKey="v" stroke={stroke} strokeWidth={2} dot={false} />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+export function ScoreHero({ snap }: { snap: ScoreSnapshot }) {
+  const delta = (arr: number[]) =>
+    arr.length >= 2 ? arr[arr.length - 1] - arr[0] : 0;
+  return (
+    <section className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="bg-zinc-900 text-zinc-100 rounded-2xl p-6 border border-zinc-800 col-span-1 md:col-span-1">
+        <p className="text-xs uppercase tracking-widest text-zinc-400">Overall Brand Health</p>
+        <p className={`text-7xl font-mono font-bold mt-2 ${band(snap.overall)}`}>{snap.overall.toFixed(0)}</p>
+        <p className="text-xs text-zinc-500 mt-2">
+          24h Δ {delta(snap.sparklines.overall).toFixed(1)}
+        </p>
+        <Spark data={snap.sparklines.overall} stroke="#22D3EE" />
+      </div>
+      <div className="bg-white rounded-2xl p-6 border">
+        <p className="text-xs uppercase tracking-widest text-gray-500">Social Media</p>
+        <p className={`text-5xl font-mono font-bold mt-2 ${band(snap.social)}`}>{snap.social.toFixed(0)}</p>
+        <p className="text-xs text-gray-500 mt-2">
+          critical {snap.social_breakdown.critical_clusters} · high {snap.social_breakdown.high_clusters} · med {snap.social_breakdown.medium_clusters}
+        </p>
+        <Spark data={snap.sparklines.social} stroke="#4f46e5" />
+      </div>
+      <div className="bg-white rounded-2xl p-6 border">
+        <p className="text-xs uppercase tracking-widest text-gray-500">LLMO</p>
+        <p className={`text-5xl font-mono font-bold mt-2 ${band(snap.llmo)}`}>{snap.llmo.toFixed(0)}</p>
+        <p className="text-xs text-gray-500 mt-2">
+          accuracy {snap.llmo_breakdown.citation_accuracy.toFixed(0)} · SOV {snap.llmo_breakdown.share_of_voice.toFixed(0)} · freq {snap.llmo_breakdown.citation_frequency.toFixed(0)}
+        </p>
+        <Spark data={snap.sparklines.llmo} stroke="#f59e0b" />
+      </div>
+    </section>
+  );
+}
+```
+
+- [ ] **Step 4: Write `frontend/hooks/useScores.ts`**
+
+```typescript
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+
+export function useScores(brandId: string) {
+  return useQuery({
+    queryKey: ["scores", brandId],
+    queryFn: () => api.scores(brandId),
+    enabled: !!brandId,
+    refetchInterval: 30_000,
+  });
+}
+```
+
+- [ ] **Step 5: Write `frontend/app/dashboard/page.tsx`**
+
+```typescript
+"use client";
+import { useScores } from "@/hooks/useScores";
+import { ScoreHero } from "@/components/ScoreHero";
+import { LLMVisibilityGrid } from "@/components/LLMVisibilityGrid";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+
+const BRAND_ID = process.env.NEXT_PUBLIC_DEMO_BRAND_ID!;
+
+export default function DashboardPage() {
+  const qc = useQueryClient();
+  const { data, isLoading } = useScores(BRAND_ID);
+  const probe = useMutation({
+    mutationFn: () => api.triggerProbe(BRAND_ID),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["scores", BRAND_ID] }),
+  });
+
+  if (isLoading || !data) return <p className="p-6 text-gray-400">Loading…</p>;
+  return (
+    <div className="p-6 space-y-6">
+      <div className="flex justify-between items-center">
+        <h1 className="text-2xl font-semibold">Brand Health</h1>
+        <button onClick={() => probe.mutate()}
+          className="bg-zinc-900 text-white px-4 py-2 rounded-lg text-sm font-mono">
+          Run LLM Probe
+        </button>
+      </div>
+      <ScoreHero snap={data} />
+      <LLMVisibilityGrid perLlm={data.llmo_breakdown.per_llm} />
+    </div>
+  );
+}
+```
+
+- [ ] **Step 6: Update `frontend/app/page.tsx`**
+
+```typescript
+import { redirect } from "next/navigation";
+export default function Home() { redirect("/dashboard"); }
+```
+
+- [ ] **Step 7: Update `frontend/app/layout.tsx` nav**
+
+```typescript
+const NAV = [
+  { href: "/dashboard", label: "Dashboard" },
+  { href: "/feed", label: "Live Feed" },
+  { href: "/clusters", label: "Clusters" },
+  { href: "/queue", label: "Priority Queue" },
+  { href: "/llmo", label: "LLMO" },
+  { href: "/actions", label: "Actions" },
+];
+```
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add frontend/app/dashboard/ frontend/app/page.tsx frontend/app/layout.tsx \
+        frontend/components/ScoreHero.tsx frontend/hooks/useScores.ts \
+        frontend/lib/types.ts frontend/lib/api.ts
+git commit -m "feat(frontend): Dashboard page with Overall/Social/LLMO ScoreHero"
+```
+
+---
+
+## Task 42: `/llmo` view — per-LLM grid + per-prompt drill-down — TRACK 3
+
+**Files:**
+- Create: `frontend/components/LLMVisibilityGrid.tsx`
+- Create: `frontend/components/PromptResults.tsx`
+- Create: `frontend/hooks/useLLMOAudits.ts`
+- Create: `frontend/app/llmo/page.tsx`
+
+- [ ] **Step 1: Write `frontend/components/LLMVisibilityGrid.tsx`**
+
+```typescript
+import type { PerLLMScore } from "@/lib/types";
+
+const DRIFT_STYLES: Record<string, string> = {
+  low: "border-green-400 bg-green-50",
+  medium: "border-amber-400 bg-amber-50",
+  high: "border-rose-400 bg-rose-50",
+};
+
+const LLM_LABELS: Record<string, string> = {
+  claude: "Claude", chatgpt: "ChatGPT", gemini: "Gemini", perplexity: "Perplexity",
+};
+
+export function LLMVisibilityGrid({ perLlm }: { perLlm: Record<string, PerLLMScore> }) {
+  return (
+    <section>
+      <h2 className="text-sm uppercase tracking-widest text-gray-500 mb-3">LLM Visibility</h2>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        {Object.entries(perLlm).map(([llm, p]) => (
+          <div key={llm} className={`rounded-2xl border-2 p-4 ${DRIFT_STYLES[p.drift]}`}>
+            <p className="text-xs font-semibold uppercase tracking-wider text-gray-600">{LLM_LABELS[llm] || llm}</p>
+            <p className="text-4xl font-mono font-bold mt-2">{p.score.toFixed(0)}</p>
+            <div className="mt-3 text-xs text-gray-600 space-y-1">
+              <div className="flex justify-between"><span>mention rate</span><span className="font-mono">{p.mention_rate.toFixed(0)}%</span></div>
+              <div className="flex justify-between"><span>avg position</span><span className="font-mono">{p.avg_position.toFixed(1)}</span></div>
+              <div className="flex justify-between"><span>drift</span>
+                <span className={`font-mono uppercase ${
+                  p.drift === "high" ? "text-rose-600" :
+                  p.drift === "medium" ? "text-amber-600" : "text-green-600"}`}>{p.drift}</span>
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+```
+
+- [ ] **Step 2: Write `frontend/components/PromptResults.tsx`**
+
+```typescript
+"use client";
+import type { LLMAudit } from "@/lib/types";
+
+export function PromptResults({ audits }: { audits: LLMAudit[] }) {
+  // Group by prompt → per-LLM cells
+  const byPrompt: Record<string, Record<string, LLMAudit[]>> = {};
+  for (const a of audits) {
+    byPrompt[a.prompt] ??= {};
+    byPrompt[a.prompt][a.llm] ??= [];
+    byPrompt[a.prompt][a.llm].push(a);
+  }
+  const llms = ["claude", "chatgpt", "gemini", "perplexity"];
+  return (
+    <table className="w-full text-xs border-collapse">
+      <thead className="text-left text-gray-500 border-b">
+        <tr>
+          <th className="p-2 w-1/3">Prompt</th>
+          {llms.map(l => <th key={l} className="capitalize p-2">{l}</th>)}
+        </tr>
+      </thead>
+      <tbody>
+        {Object.entries(byPrompt).map(([prompt, perLlm]) => (
+          <tr key={prompt} className="border-b">
+            <td className="p-2 align-top">{prompt}</td>
+            {llms.map(l => {
+              const cellAudits = perLlm[l] || [];
+              if (!cellAudits.length) return <td key={l} className="p-2 text-gray-300">—</td>;
+              const mentioned = cellAudits.filter(a => a.mentioned).length;
+              const total = cellAudits.length;
+              const avgDrift = cellAudits.reduce((s, a) => s + a.drift_score, 0) / total;
+              return (
+                <td key={l} className="p-2">
+                  <div className="font-mono">{mentioned}/{total} mentioned</div>
+                  <div className="text-gray-500">drift {avgDrift.toFixed(2)}</div>
+                </td>
+              );
+            })}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+```
+
+- [ ] **Step 3: Write `frontend/hooks/useLLMOAudits.ts`**
+
+```typescript
+import { useQuery } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+
+export function useLLMOAudits(brandId: string, llm?: string) {
+  return useQuery({
+    queryKey: ["llmo_audits", brandId, llm],
+    queryFn: () => api.llmoAudits(brandId, llm),
+    enabled: !!brandId,
+  });
+}
+```
+
+- [ ] **Step 4: Write `frontend/app/llmo/page.tsx`**
+
+```typescript
+"use client";
+import { useState } from "react";
+import { useScores } from "@/hooks/useScores";
+import { useLLMOAudits } from "@/hooks/useLLMOAudits";
+import { LLMVisibilityGrid } from "@/components/LLMVisibilityGrid";
+import { PromptResults } from "@/components/PromptResults";
+
+const BRAND_ID = process.env.NEXT_PUBLIC_DEMO_BRAND_ID!;
+const LLMS = ["all", "claude", "chatgpt", "gemini", "perplexity"];
+
+export default function LLMOPage() {
+  const [llm, setLlm] = useState("all");
+  const { data: scores } = useScores(BRAND_ID);
+  const { data: audits } = useLLMOAudits(BRAND_ID, llm === "all" ? undefined : llm);
+
+  return (
+    <div className="p-6 space-y-6">
+      <h1 className="text-2xl font-semibold">LLMO</h1>
+      {scores && <LLMVisibilityGrid perLlm={scores.llmo_breakdown.per_llm} />}
+      <div className="bg-white rounded-2xl p-5 shadow-sm">
+        <div className="flex gap-2 mb-3">
+          {LLMS.map(l => (
+            <button key={l} onClick={() => setLlm(l)}
+              className={`px-3 py-1 rounded-full text-sm capitalize ${
+                llm === l ? "bg-zinc-900 text-white" : "bg-gray-100"}`}>
+              {l}
+            </button>
+          ))}
+        </div>
+        <PromptResults audits={audits?.audits ?? []} />
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add frontend/components/LLMVisibilityGrid.tsx frontend/components/PromptResults.tsx \
+        frontend/hooks/useLLMOAudits.ts frontend/app/llmo/
+git commit -m "feat(frontend): /llmo per-LLM grid + per-prompt drill-down"
+```
+
+---
+
+## Task 43: GroundTruthDriftCard surface in Actions view — TRACK 3
+
+**Files:**
+- Create: `frontend/components/GroundTruthDriftCard.tsx`
+- Modify: `frontend/app/actions/page.tsx` (render correction cards differently)
+
+- [ ] **Step 1: Write `frontend/components/GroundTruthDriftCard.tsx`**
+
+```typescript
+"use client";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "@/lib/api";
+import type { Action } from "@/lib/types";
+
+const BRAND_ID = process.env.NEXT_PUBLIC_DEMO_BRAND_ID!;
+
+export function GroundTruthDriftCard({ action }: { action: Action }) {
+  const qc = useQueryClient();
+  const decide = useMutation({
+    mutationFn: (body: any) => api.decide(action.id, body),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["actions", BRAND_ID] }),
+  });
+  const draft = action.draft as { text: string; destinations: string[]; drifted_llms: string[] };
+
+  return (
+    <div className="bg-rose-50 border-2 border-rose-300 rounded-xl p-5 space-y-3">
+      <div className="flex justify-between items-center">
+        <span className="text-xs uppercase font-bold text-rose-700">GROUND TRUTH DRIFT</span>
+        <span className="text-xs text-rose-600">{draft.drifted_llms.join(" · ")}</span>
+      </div>
+      <p className="text-sm">{draft.text}</p>
+      <p className="text-xs text-gray-500">
+        Publish to: {draft.destinations.join(", ")}
+      </p>
+      <div className="flex gap-2">
+        <button onClick={() => decide.mutate({ decision: "approve" })}
+          className="bg-rose-600 text-white px-4 py-1.5 rounded text-sm">Publish Correction</button>
+        <button onClick={() => decide.mutate({ decision: "reject", reject_reason: "drift not material" })}
+          className="bg-gray-200 px-4 py-1.5 rounded text-sm">Dismiss</button>
+      </div>
+    </div>
+  );
+}
+```
+
+- [ ] **Step 2: Update `frontend/app/actions/page.tsx` to route correction cards**
+
+```typescript
+"use client";
+import { useActions } from "@/hooks/useActions";
+import { ActionCard } from "@/components/ActionCard";
+import { GroundTruthDriftCard } from "@/components/GroundTruthDriftCard";
+
+const BRAND_ID = process.env.NEXT_PUBLIC_DEMO_BRAND_ID!;
+
+export default function ActionsPage() {
+  const { data, isLoading } = useActions(BRAND_ID);
+  if (isLoading) return <p className="p-6 text-gray-400">Loading…</p>;
+  return (
+    <div className="p-6 grid grid-cols-1 lg:grid-cols-2 gap-4">
+      {data?.actions.map((a) =>
+        a.type === "ground_truth_correction"
+          ? <GroundTruthDriftCard key={a.id} action={a} />
+          : <ActionCard key={a.id} action={a} />
+      )}
+      {data && data.actions.length === 0 && (
+        <p className="text-gray-400 col-span-full">No pending actions.</p>
+      )}
+    </div>
+  );
+}
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add frontend/components/GroundTruthDriftCard.tsx frontend/app/actions/page.tsx
+git commit -m "feat(frontend): ground_truth_correction surface in Actions view"
+```
+
+---
+
+## LLMO Self-Review
+
+- **Spec §A coverage:** §A.2 → Task 35 · §A.3 → Task 36 · §A.4 → Task 37 · §A.5 → Tasks 34, 41 · §A.6 → Task 38 · §A.7 → Tasks 41, 42 · §A.8 → Task 40 · §A.9 → demo follows from 41/42 · §A.10 → ownership in updated partition.
+- **Type consistency:** `ScoreSnapshot.llmo_breakdown.per_llm` keys (`claude/chatgpt/gemini/perplexity`) match backend `LLMS` constant in `pipeline/llmo.py` and `brand_scoring.py`.
+- **Placeholders:** none. Every step has runnable code or an exact command.
+- **Free-tier cost check:** Probe = 10 prompts × 4 LLMs × 3 reps × 2 Gemini calls (response + judge) = 240 calls per probe iteration. At one probe every 15 min during a demo run, that's tractable on Gemini AI Studio free tier (15 RPM for 1.5-flash) — we cap demo to one full probe iteration on the "Run LLM Probe" button + one cron-fired iteration.
+

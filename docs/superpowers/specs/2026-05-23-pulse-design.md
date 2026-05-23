@@ -369,3 +369,220 @@ $349/mo SaaS → ~60% gross margin. Luminai priced separately as healthcare add-
 
 **Document Version:** 1.0 (auto-approved 2026-05-23)
 **Status:** Ready for Implementation
+
+---
+
+# Addendum: LLMO (LLM Optimization) as First-Class Subsystem
+
+> **Added 2026-05-23 per user direction:** "Search for llmo stuff fully and incorporate llmo into key framework of what we r doing. And then i need u to, on the main page when u give an overall score, give social media subscore and llmo subscore."
+
+## A.1 Why LLMO
+
+LLMO (Large Language Model Optimization, also called Generative Engine Optimization / GEO) is the discipline of tracking and shaping how AI models — ChatGPT, Claude, Gemini, Perplexity — describe, cite, and contextualize a brand. **Per industry research (Gartner / Searchengineland / Frase 2026):**
+
+- **58% of online searches involve an AI-generated answer or summary** (mid-2025).
+- LLMO targets **mention probability and citation accuracy**, not ranking position.
+- **Cross-platform variance is enormous** — ChatGPT and Perplexity agree on the top recommended brand only 60-80% of the time → must surface per-LLM breakdown.
+- **Detection rigor:** multi-model consensus (≥3 LLMs citing same work) yields 95.6% accuracy; within-prompt repetition (≥2 replications) yields 88.9%. Run each probe prompt 3-5× per LLM for stability.
+
+Legacy social-listening tools (Brandwatch, Sprout, Mention) don't do this at all. LLMO is the 2026 wedge.
+
+## A.2 LLMO Pipeline (parallel to Monitor → Cluster → Score → Act)
+
+```
+            ┌─→ Monitor (social) → Cluster → Score (social_score) ─┐
+            │                                                       │
+Brand ──────┤                                                       ├─→ Overall Score
+            │                                                       │
+            └─→ LLM Probe       → Audit Store → LLMO Score ────────┘
+                                                       │
+                                                       └─→ Act (ground-truth correction, prompt-content fill)
+```
+
+### Stage L — LLM Probe (new, runs on a cron — every 15 min during demo)
+
+1. Load `brand_prompts` for the brand (10-20 synthetic queries a buyer would actually ask: *"best AI law firm for startups"*, *"alternatives to Harvey AI"*, etc.).
+2. For each prompt × each LLM (Claude, ChatGPT, Gemini, Perplexity), run the prompt **3 times** (within-prompt repetition for stability).
+3. Implementation: **Gemini-with-system-prompt-impersonation** for all 4 (faster, free-tier-friendly, deterministic). The system prompt tells the model to respond as if it were Claude/ChatGPT/Gemini/Perplexity, honoring known training-cutoff + style differences. Real provider APIs are an upgrade path post-MVP.
+4. For each response, extract:
+   - `mentioned: bool` — does the response mention the brand
+   - `position: int` — 1 = headline/first sentence, 2 = early body, 3 = later body, 4 = list item, 0 = absent
+   - `competitors_mentioned: string[]` — known competitor names from a per-brand list
+   - `sentiment: float` (−1..+1) — how the brand is positioned
+   - `claims: string[]` — factual claims about the brand
+   - `drift_score: float` (0..1) — Gemini scores each claim against the brand's `ground_truth` doc; aggregate = drift score
+5. Write to ClickHouse `llmo_audits` (append-only). Trigger LLMO score recompute.
+
+## A.3 LLMO Score (0-100)
+
+```
+LLMO Score = 0.30·CitationFrequency + 0.25·ShareOfVoice + 0.25·CitationAccuracy + 0.20·SentimentQuality
+```
+
+| Component | Formula |
+|---|---|
+| **CitationFrequency** | `Σ position_weight(audit) / total_probes · 100`, where `position_weight = {1: 1.0, 2: 0.7, 3: 0.4, 4: 0.2, 0: 0}` |
+| **ShareOfVoice** | `brand_mentions / (brand_mentions + Σ competitor_mentions) · 100` across all probes |
+| **CitationAccuracy** | `avg(100 · (1 − drift_score))` across audits where `mentioned=true` |
+| **SentimentQuality** | `avg sentiment in [-1..1]` → linearly rescaled to `[0..100]` |
+
+### Per-LLM grid (must render on main page)
+
+Each LLM gets its own card showing: LLMO score, citation frequency, drift indicator, last 24h trend sparkline. This surfaces the cross-platform variance directly — "you score 87 in Claude but 61 in ChatGPT, and the drift is here."
+
+## A.4 Overall Brand Health (the main page hero)
+
+```
+Overall Brand Health = 0.50·SocialScore + 0.50·LLMOScore
+```
+
+`SocialScore` is the brand-aggregate roll-up of the existing severity model:
+```
+SocialScore = 100 − clamp(weighted_severity_pressure_24h, 0, 100)
+weighted_severity_pressure_24h = Σ(critical_clusters × 30 + high × 15 + medium × 5)
+```
+
+Higher SocialScore = healthier (fewer critical clusters in the last 24h). Pulse's existing per-cluster `severity_score` is unchanged; the brand-level `SocialScore` is a *new* roll-up that lives on `pulse_scores` snapshots.
+
+The main-page hero shows **3 big numbers side by side**:
+- **OVERALL** (composite, 0-100, large central number)
+- **SOCIAL** (subscore + delta vs 24h + sparkline)
+- **LLMO** (subscore + delta vs 24h + sparkline)
+
+## A.5 New data model
+
+### TypeScript additions
+
+```typescript
+export interface LLMAudit {
+  id: string;
+  brand_id: string;
+  llm: "claude" | "chatgpt" | "gemini" | "perplexity";
+  prompt: string;
+  prompt_id: string;
+  response: string;
+  mentioned: boolean;
+  position: 0 | 1 | 2 | 3 | 4;
+  competitors_mentioned: string[];
+  sentiment: number;          // -1..+1
+  claims: string[];
+  drift_score: number;        // 0..1
+  citation_accuracy: number;  // 0..100
+  ingested_at: string;
+}
+
+export interface BrandPrompt {
+  id: string;
+  brand_id: string;
+  prompt: string;
+  intent: string;             // "comparison" | "discovery" | "alternative" | "research"
+}
+
+export interface ScoreSnapshot {
+  brand_id: string;
+  timestamp: string;
+  overall: number;
+  social: number;
+  llmo: number;
+  social_breakdown: {
+    critical_clusters: number;
+    high_clusters: number;
+    medium_clusters: number;
+    volume_24h: number;
+    negative_pct: number;
+  };
+  llmo_breakdown: {
+    citation_frequency: number;
+    share_of_voice: number;
+    citation_accuracy: number;
+    sentiment_quality: number;
+    per_llm: Record<"claude"|"chatgpt"|"gemini"|"perplexity", {
+      score: number;
+      mention_rate: number;
+      avg_position: number;
+      drift: "low" | "medium" | "high";
+    }>;
+  };
+}
+```
+
+### ClickHouse — `llmo_audits` (new)
+
+```sql
+CREATE TABLE IF NOT EXISTS llmo_audits (
+    id                    UUID,
+    brand_id              UUID,
+    llm                   LowCardinality(String),
+    prompt                String,
+    prompt_id             UUID,
+    response              String,
+    mentioned             UInt8,
+    position              UInt8,
+    competitors_mentioned Array(String),
+    sentiment             Float32,
+    claims                Array(String),
+    drift_score           Float32,
+    citation_accuracy     Float32,
+    ingested_at           DateTime64(3, 'UTC') DEFAULT now64()
+)
+ENGINE = MergeTree
+ORDER BY (brand_id, llm, ingested_at);
+```
+
+### Postgres additions
+
+```sql
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS ground_truth TEXT;
+ALTER TABLE brands ADD COLUMN IF NOT EXISTS competitors TEXT[] NOT NULL DEFAULT '{}';
+
+CREATE TABLE IF NOT EXISTS brand_prompts (
+    id        UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    brand_id  UUID NOT NULL REFERENCES brands(id),
+    prompt    TEXT NOT NULL,
+    intent    TEXT NOT NULL DEFAULT 'discovery'
+);
+```
+
+## A.6 New API endpoints
+
+| Method | Path | Returns |
+|---|---|---|
+| GET | `/api/scores?brand_id=` | Current `ScoreSnapshot` + 24h sparklines for overall/social/llmo |
+| GET | `/api/llmo/audits?brand_id=&llm=` | Recent LLMAudits (paged), filterable by LLM |
+| POST | `/api/llmo/probe?brand_id=` | Manually trigger one LLM probe iteration (used by the demo's "tick now" button) |
+| GET | `/api/brands/{id}/prompts` · POST | Brand-prompts CRUD |
+
+## A.7 Frontend addition — `/dashboard` (the main page, default redirect)
+
+Replaces `/feed` as the default landing page. Top section: 3-number hero (Overall/Social/LLMO). Below: per-LLM grid for LLMO + critical anomalies + recent activity. Updated nav:
+
+```
+Pulse  |  Dashboard  ·  Live Feed  ·  Clusters  ·  Priority Queue  ·  LLMO  ·  Actions
+```
+
+New components:
+- `<ScoreHero />` — three big numbers side-by-side with sparklines + deltas
+- `<LLMVisibilityGrid />` — 4 cards, one per LLM, with score / mention rate / drift indicator
+- `<PromptResults />` — drill-down: per-prompt × per-LLM matrix showing where the brand appeared
+- `<GroundTruthDriftCard />` — currently-detected drift event with side-by-side ground truth vs LLM claim + drafted correction (lives in Actions queue as `ground_truth_correction` action type — same approval workflow)
+
+## A.8 Action type addition
+
+`ground_truth_correction` joins the existing 6 action types. Triggered when `drift_score > 0.4` on any LLM. Draft is generated by Gemini using the brand's `ground_truth` doc. Routed through the same `Pending → Approved → Executed` workflow; on execution, Pulse posts the correction to the brand's Slack `#brand-corrections` channel (and in future, files a structured correction with the LLM provider where supported).
+
+## A.9 Demo narrative update
+
+The original Acme Coffee social-only demo still works. **Better demo flow (recommended)** auditing a real brand (Crosby or any sponsor) and showing the LLMO drift event in front of judges:
+
+1. 0:00 — Dashboard: Overall 73 / Social 81 / LLMO 65 (LLMO visibly lower). The story already lives in the numbers.
+2. 0:30 — Live Feed: social posts streaming.
+3. 0:50 — LLMO view: ChatGPT card pulses, citation accuracy drops, "DRIFT DETECTED" badge appears.
+4. 1:10 — Side-by-side: ground truth vs ChatGPT's description.
+5. 1:30 — Actions queue: drafted `ground_truth_correction` waiting for approval — and a regular `response` action for a social cluster underneath.
+6. 1:50 — Approve correction → Slack post lands.
+7. 2:10 — Close: "Pulse fuses social listening with LLMO — what your customers say *and* what the AIs say about you, on one composite Brand Health score."
+
+## A.10 LLMO worktree ownership
+
+`lib/llmo/*`, `app/pipeline/llmo.py`, `app/pipeline/llmo_scoring.py`, `app/api/llmo_routes.py`, and the `llmo_audits` migration belong to **Track 1 (Engine)**. The `<ScoreHero />`, `<LLMVisibilityGrid />`, `<PromptResults />`, `<GroundTruthDriftCard />` components and the `/dashboard` + `/llmo` pages belong to **Track 3 (Frontend)**. The `/api/scores`, `/api/llmo/*`, and `/api/brands/.../prompts` routes belong to **Track 2 (Surface)**.
+
