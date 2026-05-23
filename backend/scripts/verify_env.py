@@ -33,20 +33,36 @@ def record(name: str, required: bool, ok: bool, detail: str = ""):
     results.append((name, required, ok, detail))
 
 
-async def check_gemini():
-    key = os.environ.get("GEMINI_API_KEY", "")
+async def check_groq():
+    key = os.environ.get("GROQ_API_KEY", "")
     if not key:
-        return record("Gemini", True, False, "GEMINI_API_KEY not set")
+        return record("Groq", True, False, "GROQ_API_KEY not set")
     try:
-        from google import genai
-        client = genai.Client(api_key=key)
-        resp = await client.aio.models.generate_content(
-            model="gemini-1.5-flash", contents="say 'ok' in one word",
+        from groq import AsyncGroq
+        client = AsyncGroq(api_key=key)
+        resp = await client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": "say 'ok' in one word"}],
+            max_tokens=4,
+            temperature=0,
         )
-        ok = "ok" in (resp.text or "").lower()
-        record("Gemini", True, ok, f'gemini-1.5-flash response: "{(resp.text or "").strip()[:30]}"')
+        out = (resp.choices[0].message.content or "").strip()
+        ok = "ok" in out.lower()
+        record("Groq", True, ok, f'llama-3.1-8b → "{out[:30]}"')
     except Exception as e:
-        record("Gemini", True, False, f"{type(e).__name__}: {str(e)[:80]}")
+        record("Groq", True, False, f"{type(e).__name__}: {str(e)[:80]}")
+
+
+async def check_embedder():
+    """Local sentence-transformers — first call downloads model (~80MB)."""
+    try:
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+        vec = model.encode(["hello world"], normalize_embeddings=True)
+        record("Embedder (local)", True, len(vec[0]) == 384,
+               f"all-MiniLM-L6-v2 → {len(vec[0])}-dim vector")
+    except Exception as e:
+        record("Embedder (local)", True, False, f"{type(e).__name__}: {str(e)[:80]}")
 
 
 async def check_clickhouse():
@@ -148,7 +164,8 @@ async def main():
     print(f"\nUsing .env at: {REPO_ROOT / '.env'}\n")
     print("Checking services:\n")
 
-    await check_gemini()
+    await check_groq()
+    await check_embedder()
     await check_clickhouse()
     await check_postgres()
     await check_redis()
