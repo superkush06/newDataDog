@@ -4,6 +4,7 @@ import clsx from "clsx";
 import { useActions } from "@/hooks/useActions";
 import { ActionCard } from "@/components/ActionCard";
 import { GroundTruthDriftCard } from "@/components/GroundTruthDriftCard";
+import { PendingXReplyCard } from "@/components/PendingXReplyCard";
 import { SectionHeader } from "@/components/SectionHeader";
 import { PageState } from "@/components/PageState";
 import type { ActionType } from "@/lib/types";
@@ -74,23 +75,29 @@ export default function ActionsPage() {
         }
       />
 
-      {data.actions.length === 0 ? (
-        <div className="ink-glass rounded-sm p-8 text-center">
-          <p className="font-display text-xl text-paper">No actions match these filters</p>
-        </div>
-      ) : (
-        <div className="space-y-3">
-          {data.actions.map((action, i) => (
-            <div key={action.id} className="rise" style={{ animationDelay: `${i * 40}ms` }}>
+      <div className="space-y-3">
+        {/* Demo: live X reply staged by the X monitoring agent. Sits above the
+            regular action queue so judges see it first. */}
+        {stateFilter === "pending" && (
+          <div className="rise"><PendingXReplyCard /></div>
+        )}
+
+        {data.actions.length === 0 ? (
+          <div className="ink-glass rounded-sm p-8 text-center">
+            <p className="font-display text-xl text-paper">No further actions match these filters</p>
+          </div>
+        ) : (
+          data.actions.map((action, i) => (
+            <div key={action.id} className="rise" style={{ animationDelay: `${(i + 1) * 40}ms` }}>
               {action.type === "ground_truth_correction" ? (
                 <GroundTruthDriftCard action={action} />
               ) : (
                 <ActionCard action={action} />
               )}
             </div>
-          ))}
-        </div>
-      )}
+          ))
+        )}
+      </div>
     </div>
   );
 }
