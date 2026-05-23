@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS clusters (
   brand_id            UUID NOT NULL REFERENCES brands(id),
   name                TEXT,
   summary             TEXT,
-  centroid            VECTOR(768),
+  centroid            VECTOR(384),
   post_count          INT NOT NULL DEFAULT 0,
   severity            severity_enum NOT NULL DEFAULT 'low',
   severity_score      FLOAT NOT NULL DEFAULT 0,
@@ -41,7 +41,7 @@ CREATE TABLE IF NOT EXISTS clusters (
 CREATE TABLE IF NOT EXISTS post_vectors (
   post_id    UUID PRIMARY KEY,
   brand_id   UUID NOT NULL REFERENCES brands(id),
-  embedding  VECTOR(768),
+  embedding  VECTOR(384),
   cluster_id UUID REFERENCES clusters(id)
 );
 
