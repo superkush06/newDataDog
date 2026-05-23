@@ -20,7 +20,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest==8.0.0", "pytest-asyncio==0.23.4"]
+dev = ["pytest>=8.0.0", "pytest-asyncio>=0.25.0"]
+
+[tool.setuptools]
+packages = ["app", "app.api", "app.adapters", "app.core", "app.pipeline", "app.destinations", "app.workers"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
