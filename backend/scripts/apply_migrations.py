@@ -14,6 +14,29 @@ MIGRATIONS = ROOT / "migrations"
 load_dotenv(REPO_ROOT / ".env")
 
 
+def _statements(path: Path) -> list[str]:
+    return [stmt.strip() for stmt in path.read_text().split(";") if stmt.strip()]
+
+
+def _clickhouse_files() -> list[Path]:
+    files = []
+    for path in sorted(MIGRATIONS.glob("*.sql")):
+        name = path.name
+        if "postgres" in name:
+            continue
+        if name.endswith("_clickhouse.sql") or name == "001_clickhouse.sql" or name == "003_llmo.sql":
+            files.append(path)
+    return files
+
+
+def _postgres_files() -> list[Path]:
+    return [
+        path
+        for path in sorted(MIGRATIONS.glob("*.sql"))
+        if "postgres" in path.name
+    ]
+
+
 async def apply_clickhouse():
     import clickhouse_connect
     client = await clickhouse_connect.get_async_client(
@@ -23,19 +46,23 @@ async def apply_clickhouse():
         password=os.environ.get("CLICKHOUSE_PASSWORD", ""),
         secure=True,
     )
-    sql = (MIGRATIONS / "001_clickhouse.sql").read_text()
-    for stmt in [s.strip() for s in sql.split(";") if s.strip()]:
-        await client.command(stmt)
-    print("✓ ClickHouse migrations applied")
+    files = _clickhouse_files()
+    for path in files:
+        for stmt in _statements(path):
+            await client.command(stmt)
+    print(f"✓ ClickHouse migrations applied ({len(files)} files)")
 
 
 async def apply_postgres():
     import asyncpg
     conn = await asyncpg.connect(os.environ["DATABASE_URL"])
-    sql = (MIGRATIONS / "002_postgres.sql").read_text()
-    await conn.execute(sql)
-    await conn.close()
-    print("✓ Postgres migrations applied")
+    files = _postgres_files()
+    try:
+        for path in files:
+            await conn.execute(path.read_text())
+    finally:
+        await conn.close()
+    print(f"✓ Postgres migrations applied ({len(files)} files)")
 
 
 async def main():
