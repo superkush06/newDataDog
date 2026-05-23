@@ -5,10 +5,13 @@ import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
-load_dotenv()
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent       # backend/
+REPO_ROOT = ROOT.parent                              # repo root
 MIGRATIONS = ROOT / "migrations"
+
+# Global .env at repo root
+load_dotenv(REPO_ROOT / ".env")
 
 
 async def apply_clickhouse():
