@@ -1,8 +1,14 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Single global .env lives at the repo root.
+# backend/app/config.py → up 3 dirs → repo root.
+ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=str(ROOT_ENV), extra="ignore")
 
     gemini_api_key: str = ""
     nimble_api_key: str = ""

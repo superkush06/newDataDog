@@ -8,20 +8,39 @@ Social listening + action pipeline. Monitor → Cluster → Score → Act.
 
 ## Quickstart (after all tracks merge)
 
+**Single global `.env` at the repo root** powers both backend and frontend.
+
 ```bash
-# Backend
+# 0. Credentials — one file for everything
+cp .env.example .env       # fill in GEMINI_API_KEY, CLICKHOUSE_*, DATABASE_URL,
+                           # NIMBLE_API_KEY, REDIS_URL, DD_API_KEY, NEXT_PUBLIC_*
+
+# 1. Backend
 cd backend && python -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
-cp .env.example .env  # fill in keys
-python scripts/apply_migrations.py
+python scripts/verify_env.py        # pings every service, shows what works
+python scripts/apply_migrations.py  # ClickHouse + Postgres+pgvector
 uvicorn app.main:app --reload &
 arq app.workers.pipeline_worker.WorkerSettings &
 
-# Frontend
+# 2. Frontend (after track-3 merges)
 cd ../frontend && npm install
-cp .env.local.example .env.local  # set NEXT_PUBLIC_DEMO_BRAND_ID
+# Next.js auto-loads NEXT_PUBLIC_* from ../.env via next.config.js
 npm run dev
 ```
+
+### Env layout
+
+```
+newDataDog/
+├── .env          ← single source of truth (gitignored)
+├── .env.example  ← template (committed)
+├── backend/      ← reads ../.env via pydantic-settings
+└── frontend/     ← reads ../.env via next.config.js (when track-3 lands)
+```
+
+Backend `app/config.py` resolves the file via
+`Path(__file__).resolve().parents[2] / ".env"` so it works from any cwd.
 
 ## Parallel execution
 
